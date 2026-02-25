@@ -1,0 +1,6 @@
+cache/
+screenshots/
+__pycache__/
+*.pyc
+*cookies*.txt
+*.bak

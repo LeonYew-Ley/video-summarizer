@@ -1,0 +1,10 @@
+{
+    "_comment": "Video Summarizer configuration. whisper_mode: 'disabled' | 'local' | 'api'. extract_frames: true to capture keyframes. cache_ttl_days: 0 = forever.",
+    "whisper_mode": "local",
+    "openai_api_key": "",
+    "whisper_model": "base",
+    "language": "zh",
+    "extract_frames": true,
+    "frames_per_video": 6,
+    "cache_ttl_days": 7
+}

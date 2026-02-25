@@ -1,0 +1,20 @@
+# Multi-Platform Video Summarizer - Optional Dependencies
+#
+# Bilibili: no extra dependencies needed (Python stdlib only)
+# YouTube: youtube-transcript-api
+# All other platforms: yt-dlp
+# Whisper ASR fallback: faster-whisper (local) or openai (API)
+#
+# Install only what you need:
+#   pip install youtube-transcript-api yt-dlp          # YouTube + all platforms
+#   pip install faster-whisper                          # Local Whisper ASR
+#   pip install openai                                  # OpenAI Whisper API
+#   pip install pydub                                   # Audio splitting for large files (API mode)
+#   pip install Pillow                                   # Image resizing for keyframe screenshots
+
+youtube-transcript-api
+yt-dlp
+faster-whisper
+openai
+pydub
+Pillow
