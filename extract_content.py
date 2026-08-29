@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -226,6 +227,8 @@ BILI_HEADERS = {
     **DEFAULT_HEADERS,
     "Referer": "https://www.bilibili.com",
     "Origin": "https://www.bilibili.com",
+    # Guest device id only — not a login cookie. Avoids some 412s on page fetch.
+    "Cookie": f"buvid3={str(uuid.uuid4()).upper()}infoc; b_nut={int(time.time())}",
 }
 
 API_VIDEO_VIEW = "https://api.bilibili.com/x/web-interface/view"
@@ -1325,12 +1328,13 @@ WEIXIN_HEADERS = {
     "Referer": "https://mp.weixin.qq.com/",
 }
 
-WEIXIN_BLOCKED_MARKERS = (
-    'id="js_verify"',
-    'id="verify_code"',
+WEIXIN_PAYWALL_MARKERS = (
     "is_pay_subscribe: '1'",
     'is_pay_subscribe: "1"',
-    "付费阅读",
+)
+WEIXIN_VERIFY_MARKERS = (
+    'id="js_verify"',
+    'id="verify_code"',
     "此内容需关注",
     "关注后才能阅读",
     "关注后可查看",
@@ -1338,6 +1342,9 @@ WEIXIN_BLOCKED_MARKERS = (
     "环境异常",
     "完成验证后即可继续访问",
 )
+# Body copy about the product feature is not a paywall. Only treat
+# 「付费阅读」as blocked when the article is not explicitly free.
+WEIXIN_PAYWALL_PHRASE = "付费阅读"
 
 
 class _WeixinContentParser(HTMLParser):
@@ -1382,7 +1389,15 @@ class _WeixinContentParser(HTMLParser):
 def _weixin_blocked_reason(html):
     if not html:
         return "empty page"
-    for marker in WEIXIN_BLOCKED_MARKERS:
+    for marker in WEIXIN_PAYWALL_MARKERS:
+        if marker in html:
+            return marker
+    explicitly_free = (
+        "is_pay_subscribe: '0'" in html or 'is_pay_subscribe: "0"' in html
+    )
+    if WEIXIN_PAYWALL_PHRASE in html and not explicitly_free:
+        return WEIXIN_PAYWALL_PHRASE
+    for marker in WEIXIN_VERIFY_MARKERS:
         if marker in html:
             return marker
     if "js_content" not in html and ("verify" in html.lower() or "captcha" in html.lower()):
