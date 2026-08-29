@@ -638,6 +638,17 @@ DOUYIN_MOBILE_UA = (
     "Cronet/TTNetVersion:b4d74d15 2023-04-08)"
 )
 
+# Public SEO snapshot of the share page (item_list is no longer in app SSR).
+DOUYIN_SEO_UA = (
+    "Mozilla/5.0 (compatible; Baiduspider/2.0; "
+    "+http://www.baidu.com/search/spider.html)"
+)
+DOUYIN_SEO_IMAGE_RE = re.compile(
+    r"https://p\d+-pc-sign\.douyinpic\.com/"
+    r"(tos-cn-i-[^/\"'\s~]+/[^/\"'\s~]+)~tplv-dy-aweme-images[^\"'\s]*",
+    re.I,
+)
+
 AUTO_COOKIES_PATH = os.path.join(SCRIPT_DIR, "_auto_douyin_cookies.txt")
 
 
@@ -811,8 +822,55 @@ def _douyin_item_from_share_html(html):
             return item
     render_data = _parse_script_assignment(html, "window._RENDER_DATA")
     if render_data:
-        return _find_item_list(render_data)
+        item = _find_item_list(render_data)
+        if item:
+            return item
+    match = re.search(
+        r'<script[^>]+id="RENDER_DATA"[^>]*>(.*?)</script>',
+        html or "",
+        re.I | re.DOTALL,
+    )
+    if match:
+        raw = urllib.parse.unquote(match.group(1).strip())
+        decoded = _loads_embedded_json(raw)
+        if decoded:
+            return _find_item_list(decoded)
     return None
+
+
+def _douyin_payload_from_seo_html(html):
+    """Parse title, author, and aweme_images from the public SEO share page."""
+    if not html:
+        return None
+    title = _weixin_meta(html, r"<title[^>]*>(.*?)</title>")
+    title = re.sub(r"\s+", " ", title).replace(" - 抖音", "").strip()
+    description = _weixin_meta(html, r'name="description"\s+content="([^"]*)"')
+    description = html_lib.unescape(description).strip()
+    author = ""
+    author_match = re.search(r" - ([^于\n]{1,40})于\d{8}发布", description)
+    if author_match:
+        author = author_match.group(1).strip()
+        description = description[: author_match.start()].strip()
+    seen = {}
+    for match in DOUYIN_SEO_IMAGE_RE.finditer(html.replace("&amp;", "&")):
+        key = match.group(1)
+        if key not in seen:
+            seen[key] = match.group(0)
+    image_urls = list(seen.values())
+    if not title and not image_urls:
+        return None
+    return {
+        "info": {
+            "title": title,
+            "author": author,
+            "duration": 0,
+            "description": description or title,
+        },
+        "play_url": None,
+        "image_urls": image_urls,
+        "aweme_type": 68 if image_urls else None,
+        "item": None,
+    }
 
 
 def _douyin_item_payload(item):
@@ -892,19 +950,33 @@ def _douyin_share_api(aweme_id, kind=None):
             f"https://www.iesdouyin.com/share/note/{aweme_id}/",
         ]
 
+    user_agents = (
+        DOUYIN_MOBILE_UA,
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1",
+    )
+    if kind != "video":
+        user_agents = user_agents + (DOUYIN_SEO_UA,)
     for share_url in share_urls:
-        try:
-            req = urllib.request.Request(share_url, headers={
-                "User-Agent": DOUYIN_MOBILE_UA,
-                "Accept": "*/*",
-            })
-            resp = urllib.request.urlopen(req, timeout=15)
-            html = resp.read().decode("utf-8", errors="replace")
-            item = _douyin_item_from_share_html(html)
-            if item:
-                return _douyin_item_payload(item)
-        except Exception as e:
-            log(f"Douyin share API failed ({share_url}): {e}", "WARN")
+        for ua in user_agents:
+            try:
+                req = urllib.request.Request(share_url, headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,*/*",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                })
+                resp = urllib.request.urlopen(req, timeout=15)
+                html = resp.read().decode("utf-8", errors="replace")
+                item = _douyin_item_from_share_html(html)
+                if item:
+                    return _douyin_item_payload(item)
+                if ua == DOUYIN_SEO_UA:
+                    seo = _douyin_payload_from_seo_html(html)
+                    if seo and seo.get("image_urls"):
+                        return seo
+            except Exception as e:
+                log(f"Douyin share API failed ({share_url}): {e}", "WARN")
     return None
 
 
