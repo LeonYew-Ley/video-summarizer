@@ -74,6 +74,24 @@ def _cache_key(url):
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
+def _normalize_input_url(raw):
+    """Pull the first http(s) URL out of share text / 口令."""
+    if not raw:
+        return raw
+    match = re.search(r"https?://[^\s<>\"'，]+", raw)
+    if match:
+        return match.group(0).rstrip(".,;)]）")
+    return raw.strip()
+
+
+def _cacheable(result):
+    if not result or result.get("error"):
+        return False
+    if result.get("subtitle_text"):
+        return True
+    return result.get("content_type") == "post" and bool(result.get("images"))
+
+
 def _read_cache(url):
     key = _cache_key(url)
     path = os.path.join(CACHE_DIR, f"{key}.json")
@@ -87,7 +105,7 @@ def _read_cache(url):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("subtitle_text"):
+            if _cacheable(data):
                 log(f"Cache hit: {key}")
                 data["_cached"] = True
                 return data
@@ -98,7 +116,7 @@ def _read_cache(url):
 
 def _write_cache(url, result):
     """Cache a successful extraction result."""
-    if not result or not result.get("subtitle_text"):
+    if not _cacheable(result):
         return
     os.makedirs(CACHE_DIR, exist_ok=True)
     key = _cache_key(url)
@@ -700,82 +718,189 @@ def _fetch_fresh_douyin_cookies():
         return None
 
 
+def _match_douyin_id(url):
+    patterns = [
+        (r"douyin\.com/note/(\d+)", "note"),
+        (r"douyin\.com/video/(\d+)", "video"),
+        (r"iesdouyin\.com/share/note/(\d+)", "note"),
+        (r"iesdouyin\.com/share/video/(\d+)", "video"),
+    ]
+    for pat, kind in patterns:
+        match = re.search(pat, url or "")
+        if match:
+            return match.group(1), kind
+    return None, None
+
+
 def _resolve_douyin_url(url):
-    """Resolve v.douyin.com short link to full URL, extract video ID."""
+    """Resolve v.douyin.com short link. Returns (aweme_id, resolved_url, kind)."""
+    url = _normalize_input_url(url)
+    resolved = url
     try:
         req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
         with urllib.request.urlopen(req, timeout=10) as resp:
             resolved = resp.url
-        match = re.search(r'douyin\.com/video/(\d+)', resolved)
-        if match:
-            return match.group(1), resolved
     except Exception as e:
         log(f"Failed to resolve Douyin URL: {e}", "WARN")
-    match = re.search(r'douyin\.com/video/(\d+)', url)
-    if match:
-        return match.group(1), url
-    return None, url
+    aweme_id, kind = _match_douyin_id(resolved)
+    if not aweme_id:
+        aweme_id, kind = _match_douyin_id(url)
+    return aweme_id, resolved, kind
 
 
-def _douyin_share_api(video_id):
-    """Fetch video metadata from iesdouyin.com share page (mobile UA, no login).
-    Returns (info_dict, play_url) or (None, None)."""
-    share_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
+def _loads_embedded_json(raw):
+    raw = (raw or "").strip()
+    if raw.endswith(";"):
+        raw = raw[:-1]
     try:
-        req = urllib.request.Request(share_url, headers={
-            "User-Agent": DOUYIN_MOBILE_UA,
-            "Accept": "*/*",
-        })
-        resp = urllib.request.urlopen(req, timeout=15)
-        html = resp.read().decode("utf-8", errors="replace")
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    cleaned = re.sub(r"\bundefined\b", "null", raw)
+    cleaned = re.sub(r"\bNaN\b", "null", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
 
-        m = re.search(r"_ROUTER_DATA\s*=\s*", html)
-        if not m:
-            return None, None
-        json_start = m.end()
-        script_end = html.find("</script>", json_start)
-        if script_end == -1:
-            return None, None
-        raw_json = html[json_start:script_end].strip()
 
-        router_data = json.loads(raw_json)
-        loader = router_data.get("loaderData", {})
-        item = None
-        for v in loader.values():
-            if not isinstance(v, dict):
-                continue
-            video_res = v.get("videoInfoRes") or v
-            items = video_res.get("item_list", [])
-            if items:
-                item = items[0]
+def _parse_script_assignment(html, marker):
+    match = re.search(re.escape(marker) + r"\s*=\s*", html or "")
+    if not match:
+        return None
+    json_start = match.end()
+    script_end = html.find("</script>", json_start)
+    if script_end == -1:
+        return None
+    return _loads_embedded_json(html[json_start:script_end])
+
+
+def _find_item_list(obj):
+    """Walk nested JSON for a Douyin item_list with aweme/video/images."""
+    if isinstance(obj, dict):
+        items = obj.get("item_list")
+        if isinstance(items, list) and items:
+            first = items[0]
+            if isinstance(first, dict) and (
+                "aweme_id" in first or "video" in first or "images" in first
+                or "image_post_info" in first
+            ):
+                return first
+        for value in obj.values():
+            found = _find_item_list(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_item_list(value)
+            if found:
+                return found
+    return None
+
+
+def _douyin_item_from_share_html(html):
+    router_data = _parse_script_assignment(html, "_ROUTER_DATA")
+    if router_data:
+        item = _find_item_list(router_data)
+        if item:
+            return item
+    render_data = _parse_script_assignment(html, "window._RENDER_DATA")
+    if render_data:
+        return _find_item_list(render_data)
+    return None
+
+
+def _douyin_item_payload(item):
+    info = {
+        "title": item.get("desc", "") or "",
+        "author": (item.get("author") or {}).get("nickname", ""),
+        "duration": (item.get("video") or {}).get("duration", 0) or 0,
+        "description": item.get("desc", "") or "",
+    }
+    dur = info["duration"]
+    if isinstance(dur, (int, float)) and dur > 10000:
+        info["duration"] = dur / 1000.0
+
+    play_url = None
+    video_obj = item.get("video") or {}
+    for addr_key in ("play_addr", "play_addr_h264", "download_addr"):
+        addr = video_obj.get(addr_key) or {}
+        if isinstance(addr, dict):
+            urls = addr.get("url_list") or []
+            if urls:
+                play_url = urls[0]
                 break
-        if not item:
-            return None, None
 
-        info = {
-            "title": item.get("desc", ""),
-            "author": (item.get("author") or {}).get("nickname", ""),
-            "duration": (item.get("video") or {}).get("duration", 0),
-            "description": item.get("desc", ""),
-        }
-        dur = info["duration"]
-        if isinstance(dur, (int, float)) and dur > 10000:
-            info["duration"] = dur / 1000.0
+    image_urls = []
+    seen = set()
 
-        play_url = None
-        video_obj = item.get("video", {})
-        for addr_key in ("play_addr", "play_addr_h264", "download_addr"):
-            addr = video_obj.get(addr_key, {})
-            if isinstance(addr, dict):
-                urls = addr.get("url_list", [])
-                if urls:
-                    play_url = urls[0]
-                    break
+    def _add_image_url(url):
+        if url and url not in seen:
+            seen.add(url)
+            image_urls.append(url)
 
-        return info, play_url
-    except Exception as e:
-        log(f"Douyin share API failed: {e}", "WARN")
-    return None, None
+    for img in item.get("images") or []:
+        if not isinstance(img, dict):
+            continue
+        url_list = img.get("url_list") or img.get("download_url_list") or []
+        if url_list:
+            _add_image_url(url_list[-1])
+    post = item.get("image_post_info") or {}
+    if isinstance(post, dict):
+        for img in post.get("images") or []:
+            if isinstance(img, dict):
+                url_list = img.get("url_list") or img.get("download_url_list") or []
+                if url_list:
+                    _add_image_url(url_list[-1])
+
+    return {
+        "info": info,
+        "play_url": play_url,
+        "image_urls": image_urls,
+        "aweme_type": item.get("aweme_type"),
+        "item": item,
+    }
+
+
+def _douyin_is_post(payload, kind):
+    if not payload:
+        return False
+    if kind == "note":
+        return True
+    if payload.get("image_urls"):
+        return True
+    return payload.get("aweme_type") in (2, 68, "2", "68")
+
+
+def _douyin_share_api(aweme_id, kind=None):
+    """Fetch metadata from iesdouyin.com share page. Returns payload dict or None."""
+    if kind == "note":
+        share_urls = [
+            f"https://www.iesdouyin.com/share/note/{aweme_id}/",
+            f"https://www.iesdouyin.com/share/video/{aweme_id}/",
+        ]
+    elif kind == "video":
+        share_urls = [f"https://www.iesdouyin.com/share/video/{aweme_id}/"]
+    else:
+        share_urls = [
+            f"https://www.iesdouyin.com/share/video/{aweme_id}/",
+            f"https://www.iesdouyin.com/share/note/{aweme_id}/",
+        ]
+
+    for share_url in share_urls:
+        try:
+            req = urllib.request.Request(share_url, headers={
+                "User-Agent": DOUYIN_MOBILE_UA,
+                "Accept": "*/*",
+            })
+            resp = urllib.request.urlopen(req, timeout=15)
+            html = resp.read().decode("utf-8", errors="replace")
+            item = _douyin_item_from_share_html(html)
+            if item:
+                return _douyin_item_payload(item)
+        except Exception as e:
+            log(f"Douyin share API failed ({share_url}): {e}", "WARN")
+    return None
 
 
 def _download_douyin_audio(play_url, tmp_dir):
@@ -818,6 +943,7 @@ XHS_MOBILE_UA = (
 
 def _resolve_xhs_url(url):
     """Resolve xhslink.com short link and extract note ID."""
+    url = _normalize_input_url(url)
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": XHS_MOBILE_UA,
@@ -833,6 +959,7 @@ def _resolve_xhs_url(url):
     for pat in [
         r"/discovery/item/([a-f0-9]+)",
         r"/explore/([a-f0-9]+)",
+        r"/item/([a-f0-9]+)",
         r"noteId[\"=:]\"?([a-f0-9]{24})",
     ]:
         m = re.search(pat, resolved)
@@ -842,74 +969,144 @@ def _resolve_xhs_url(url):
     return None, html, resolved
 
 
+def _xhs_note_from_setup(html):
+    data = _parse_script_assignment(html, "window.__SETUP_SERVER_STATE__")
+    if not data:
+        return None
+    return (data.get("LAUNCHER_SSR_STORE_PAGE_DATA") or {}).get("noteData") or None
+
+
+def _xhs_note_from_initial(html):
+    data = _parse_script_assignment(html, "window.__INITIAL_STATE__")
+    if not data:
+        return None
+    note = data.get("note") or {}
+    first_id = note.get("firstNoteId")
+    detail_map = note.get("noteDetailMap") or {}
+    if first_id and isinstance(detail_map.get(first_id), dict):
+        return detail_map[first_id].get("note")
+    for value in detail_map.values():
+        if isinstance(value, dict) and value.get("note"):
+            return value["note"]
+    return None
+
+
 def _parse_xhs_page(html):
     """Parse XHS page HTML for note data and video URLs from __SETUP_SERVER_STATE__."""
-    m = re.search(r"window\.__SETUP_SERVER_STATE__\s*=\s*", html)
-    if not m:
+    note = _xhs_note_from_html(html)
+    if not note:
         return None, None
+    return _xhs_info_from_note(note), _xhs_video_play_url(note)
 
-    json_start = m.end()
-    script_end = html.find("</script>", json_start)
-    if script_end == -1:
-        return None, None
 
-    raw = html[json_start:script_end].strip()
-    if raw.endswith(";"):
-        raw = raw[:-1]
+def _xhs_note_from_html(html):
+    note = _xhs_note_from_setup(html)
+    if note and (note.get("imageList") or _xhs_video_play_url(note) or note.get("title") or note.get("desc")):
+        return note
+    return _xhs_note_from_initial(html) or note
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None, None
 
-    note_data = data.get("LAUNCHER_SSR_STORE_PAGE_DATA", {}).get("noteData", {})
-    if not note_data:
-        return None, None
-
-    user = note_data.get("user", {})
-    video_obj = note_data.get("video", {})
-    media = video_obj.get("media", {})
-    capa = video_obj.get("capa", {})
-    vid = media.get("video", {})
-
-    duration = capa.get("duration") or vid.get("duration", 0)
+def _xhs_info_from_note(note):
+    user = note.get("user") or {}
+    video_obj = note.get("video") or {}
+    media = video_obj.get("media") or {}
+    capa = video_obj.get("capa") or {}
+    vid = media.get("video") or {}
+    duration = capa.get("duration") or vid.get("duration", 0) or 0
     if isinstance(duration, (int, float)) and duration > 10000:
         duration = duration / 1000.0
-
-    info = {
-        "title": note_data.get("title", ""),
-        "author": user.get("nickName", ""),
+    author = user.get("nickName") or user.get("nickname") or ""
+    return {
+        "title": note.get("title", "") or "",
+        "author": author,
         "duration": duration,
-        "description": note_data.get("desc", ""),
+        "description": note.get("desc", "") or "",
     }
 
-    play_url = None
-    stream = media.get("stream", {})
+
+def _xhs_video_play_url(note):
+    if not note:
+        return None
+    video_obj = note.get("video") or {}
+    media = video_obj.get("media") or {}
+    stream = media.get("stream") or {}
     for codec in ("h264", "h265", "av1", "h266"):
-        streams = stream.get(codec, [])
+        streams = stream.get(codec) or []
         if streams and isinstance(streams, list):
-            best = streams[0]
+            best = streams[0] or {}
             play_url = best.get("masterUrl")
             if play_url:
-                break
-            backup = best.get("backupUrls", [])
+                return play_url
+            backup = best.get("backupUrls") or []
             if backup:
-                play_url = backup[0]
-                break
+                return backup[0]
+    return None
 
-    return info, play_url
+
+def _xhs_is_video_note(note):
+    ntype = (note.get("type") or "").lower()
+    if ntype == "video":
+        return True
+    return bool(_xhs_video_play_url(note))
+
+
+def _xhs_image_urls(note):
+    """Rewrite imageList to ci.xiaohongshu.com URLs. None means a listed image is unusable."""
+    image_list = note.get("imageList") or []
+    urls = []
+    for item in image_list:
+        if not isinstance(item, dict):
+            return None
+        info_list = item.get("infoList") or []
+        info_url = ""
+        if info_list and isinstance(info_list[0], dict):
+            info_url = info_list[0].get("url") or ""
+        token_match = XHS_PIC_TOKEN_RE.search(info_url)
+        chosen = None
+        if token_match:
+            chosen = f"https://ci.xiaohongshu.com/{token_match.group(1)}?imageView2/2/w/0/format/png"
+        if not chosen:
+            chosen = item.get("urlDefault") or item.get("urlPre") or info_url
+        if not chosen:
+            return None
+        urls.append(chosen)
+    return urls
 
 
 def extract_xiaohongshu(url):
-    """Extract Xiaohongshu video info via mobile page HTML (no cookies needed)."""
+    """Extract Xiaohongshu video or image note via mobile page HTML."""
     note_id, html, resolved_url = _resolve_xhs_url(url)
 
+    if html and ("/404" in resolved_url or "error_code=300031" in html):
+        return _make_post_result(
+            {"title": "", "author": "", "duration": 0, "description": ""},
+            "xiaohongshu",
+            resolved_url,
+            error="Xiaohongshu note is unavailable or blocked",
+        )
+
     if html:
-        info, play_url = _parse_xhs_page(html)
-        if info:
-            log(f"XHS note: {info['title']} (duration={info['duration']}s)")
+        note = _xhs_note_from_html(html)
+        if note:
+            info = _xhs_info_from_note(note)
+            log(f"XHS note: {info['title'] or info['description'][:40]} (type={note.get('type')})")
+            if not _xhs_is_video_note(note):
+                image_urls = _xhs_image_urls(note)
+                if image_urls is None:
+                    return _make_post_result(
+                        info, "xiaohongshu", resolved_url,
+                        error="Failed to resolve Xiaohongshu image URLs",
+                    )
+                return _finalize_post(
+                    info,
+                    "xiaohongshu",
+                    resolved_url,
+                    image_urls,
+                    referer="https://www.xiaohongshu.com/",
+                    user_agent=XHS_MOBILE_UA,
+                )
             result = _make_result(info, "xiaohongshu", resolved_url)
-            result["_play_url"] = play_url
+            result["_play_url"] = _xhs_video_play_url(note)
             return result
 
     return _make_result(
@@ -944,18 +1141,48 @@ def _download_xhs_video(play_url, tmp_dir):
 
 
 def extract_douyin(url):
-    """Extract Douyin video info via the iesdouyin share page (no cookies needed).
-    Returns result dict with info (and optionally subtitle_text if found)."""
-    video_id, resolved_url = _resolve_douyin_url(url)
-    if not video_id:
+    """Extract Douyin video or image-note via the iesdouyin share page."""
+    aweme_id, resolved_url, kind = _resolve_douyin_url(url)
+    if not aweme_id:
         return None
 
-    info, play_url = _douyin_share_api(video_id)
-    if not info:
+    payload = _douyin_share_api(aweme_id, kind=kind)
+    if kind == "note":
+        info = (payload or {}).get("info") or {
+            "title": "", "author": "", "duration": 0, "description": "",
+        }
+        if not payload:
+            return _make_post_result(
+                info, "douyin", resolved_url,
+                error="Could not parse Douyin note page (share page had no embedded item data)",
+            )
+        return _finalize_post(
+            info,
+            "douyin",
+            resolved_url,
+            payload.get("image_urls") or [],
+            referer="https://www.douyin.com/",
+            user_agent=DOUYIN_MOBILE_UA,
+        )
+
+    if not payload:
         info = {"title": "", "author": "", "duration": 0, "description": ""}
+        result = _make_result(info, "douyin", resolved_url)
+        return result
+
+    info = payload["info"]
+    if _douyin_is_post(payload, kind):
+        return _finalize_post(
+            info,
+            "douyin",
+            resolved_url,
+            payload.get("image_urls") or [],
+            referer="https://www.douyin.com/",
+            user_agent=DOUYIN_MOBILE_UA,
+        )
 
     result = _make_result(info, "douyin", resolved_url)
-    result["_play_url"] = play_url
+    result["_play_url"] = payload.get("play_url")
     return result
 
 
@@ -1652,7 +1879,25 @@ def format_duration(seconds):
     return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
-def _make_result(info, platform, url, subtitle_text=None, source=None, error=None, cues=None):
+MAX_POST_IMAGES = 20
+XHS_PIC_TOKEN_RE = re.compile(
+    r"https?://sns-webpic-qc\.xhscdn\.com/\d+/[0-9a-z]+/(\S+)!"
+)
+
+
+def _make_result(
+    info,
+    platform,
+    url,
+    subtitle_text=None,
+    source=None,
+    error=None,
+    cues=None,
+    content_type="video",
+    images=None,
+    images_truncated=False,
+    images_total=None,
+):
     result = {
         "info": info,
         "platform": platform,
@@ -1660,11 +1905,121 @@ def _make_result(info, platform, url, subtitle_text=None, source=None, error=Non
         "subtitle_text": subtitle_text,
         "source": source,
         "error": error,
-        "content_type": "video",
+        "content_type": content_type,
     }
     if cues:
         result["cues"] = cues
+    if content_type == "post":
+        result["images"] = images or []
+        if images_truncated:
+            result["images_truncated"] = True
+            if images_total is not None:
+                result["images_total"] = images_total
     return result
+
+
+def _make_post_result(
+    info,
+    platform,
+    url,
+    subtitle_text="",
+    images=None,
+    error=None,
+    images_truncated=False,
+    images_total=None,
+):
+    return _make_result(
+        info,
+        platform,
+        url,
+        subtitle_text=subtitle_text,
+        source="note_page",
+        error=error,
+        content_type="post",
+        images=images,
+        images_truncated=images_truncated,
+        images_total=images_total,
+    )
+
+
+def _download_file(url, dest, headers):
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        if not data or len(data) < 32:
+            return False
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(data)
+        return True
+    except Exception as e:
+        log(f"Image download failed: {e}", "WARN")
+        return False
+
+
+def _guess_image_ext(url):
+    path = urllib.parse.urlparse(url).path.lower()
+    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        if path.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    if "format/png" in url:
+        return ".png"
+    return ".jpg"
+
+
+def _download_post_images(page_url, image_urls, referer, user_agent):
+    """Download min(len, 20) images. Returns (images, truncated, total) or None on any miss."""
+    total = len(image_urls)
+    truncated = total > MAX_POST_IMAGES
+    selected = image_urls[:MAX_POST_IMAGES]
+    if not selected:
+        return [], truncated, total
+
+    dest_dir = os.path.join(IMAGES_DIR, _cache_key(page_url))
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": referer,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    images = []
+    for index, img_url in enumerate(selected, start=1):
+        dest = os.path.join(dest_dir, f"{index:02d}{_guess_image_ext(img_url)}")
+        if os.path.exists(dest) and os.path.getsize(dest) > 32:
+            images.append({"path": os.path.abspath(dest), "index": index})
+            continue
+        if not _download_file(img_url, dest, headers):
+            return None
+        images.append({"path": os.path.abspath(dest), "index": index})
+    return images, truncated, total
+
+
+def _finalize_post(info, platform, url, image_urls, referer, user_agent):
+    title = (info.get("title") or "").strip()
+    desc = (info.get("description") or "").strip()
+    subtitle_text = desc or title
+    processable = min(len(image_urls or []), MAX_POST_IMAGES)
+    if not title and processable == 0:
+        return _make_post_result(
+            info, platform, url,
+            subtitle_text=subtitle_text,
+            error="Post has no title and no images",
+        )
+    downloaded = _download_post_images(url, image_urls or [], referer, user_agent)
+    if downloaded is None:
+        return _make_post_result(
+            info, platform, url,
+            subtitle_text=subtitle_text,
+            error="Failed to download all post images",
+        )
+    images, truncated, total = downloaded
+    return _make_post_result(
+        info, platform, url,
+        subtitle_text=subtitle_text,
+        images=images,
+        images_truncated=truncated,
+        images_total=total if truncated else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1676,6 +2031,8 @@ def extract(url, config):
     Main entry point. Tries cache, then platform-specific extraction,
     then yt-dlp subs, then Whisper ASR. Returns a result dict.
     """
+    url = _normalize_input_url(url)
+
     # Phase 0: check cache
     cached = _read_cache(url)
     if cached:
@@ -1699,6 +2056,11 @@ def extract(url, config):
 
     if result:
         play_url = result.get("_play_url")
+
+    if result and result.get("content_type") == "post":
+        if not result.get("error"):
+            _write_cache(url, result)
+        return result
 
     final_result = None
 
@@ -1784,7 +2146,7 @@ def main():
         print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, Weixin, and 1800+ sites", file=sys.stderr)
         sys.exit(1)
 
-    url = sys.argv[1]
+    url = _normalize_input_url(sys.argv[1])
     config = load_config()
 
     log(f"Extracting content for: {url}")
@@ -1795,15 +2157,17 @@ def main():
         sys.exit(1)
 
     info = result.get("info", {})
+    content_type = result.get("content_type", "video")
     output = {
-        "content_type": result.get("content_type", "video"),
+        "content_type": content_type,
         "title": info.get("title", ""),
         "author": info.get("author", ""),
-        "duration": format_duration(info.get("duration", 0)),
         "description": info.get("description", ""),
         "platform": result.get("platform", "unknown"),
         "url": result.get("url", url),
     }
+    if content_type != "post":
+        output["duration"] = format_duration(info.get("duration", 0))
 
     if result.get("error"):
         output["error"] = result["error"]
@@ -1811,16 +2175,22 @@ def main():
         sys.exit(1)
 
     output["source"] = result.get("source", "unknown")
-    output["subtitle_text"] = result["subtitle_text"]
+    output["subtitle_text"] = result.get("subtitle_text") or ""
 
-    if result.get("cues"):
-        output["cues"] = result["cues"]
-
-    if result.get("frames"):
-        output["frames"] = [
-            {"path": f["path"], "timestamp": format_duration(int(f["timestamp"]))}
-            for f in result["frames"]
-        ]
+    if content_type == "post":
+        output["images"] = result.get("images") or []
+        if result.get("images_truncated"):
+            output["images_truncated"] = True
+            if result.get("images_total") is not None:
+                output["images_total"] = result["images_total"]
+    else:
+        if result.get("cues"):
+            output["cues"] = result["cues"]
+        if result.get("frames"):
+            output["frames"] = [
+                {"path": f["path"], "timestamp": format_duration(int(f["timestamp"]))}
+                for f in result["frames"]
+            ]
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
