@@ -948,13 +948,21 @@ def _douyin_item_payload(item):
 
     play_url = None
     video_obj = item.get("video") or {}
+    play_uri = None
     for addr_key in ("play_addr", "play_addr_h264", "download_addr"):
         addr = video_obj.get(addr_key) or {}
         if isinstance(addr, dict):
+            if not play_uri:
+                play_uri = addr.get("uri")
             urls = addr.get("url_list") or []
             if urls:
                 play_url = urls[0]
                 break
+    if not play_url and play_uri:
+        play_url = (
+            f"https://www.iesdouyin.com/aweme/v1/play/"
+            f"?video_id={play_uri}&ratio=720p&line=0"
+        )
 
     image_urls = []
     seen = set()
@@ -1039,6 +1047,39 @@ def _douyin_share_api(aweme_id, kind=None):
                         return seo
             except Exception as e:
                 log(f"Douyin share API failed ({share_url}): {e}", "WARN")
+    return None
+
+
+def _douyin_payload_from_web_detail(aweme_id):
+    """Public web detail JSON via SEO UA. Share SSR no longer embeds item_list."""
+    if not aweme_id:
+        return None
+    params = {
+        "aweme_id": aweme_id,
+        "aid": "1128",
+        "version_name": "23.5.0",
+        "device_platform": "android",
+        "os_version": "2333",
+    }
+    url = "https://www.douyin.com/aweme/v1/web/aweme/detail/?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": DOUYIN_SEO_UA,
+            "Accept": "application/json,*/*",
+            "Referer": "https://www.douyin.com/",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        log(f"Douyin web detail failed: {e}", "WARN")
+        return None
+    detail = data.get("aweme_detail")
+    if not isinstance(detail, dict):
+        return None
+    payload = _douyin_item_payload(detail)
+    if payload.get("play_url") or (payload.get("info") or {}).get("title"):
+        log("Douyin video metadata from public web detail")
+        return payload
     return None
 
 
@@ -1351,6 +1392,11 @@ def extract_douyin(url):
             referer="https://www.douyin.com/",
             user_agent=DOUYIN_MOBILE_UA,
         )
+
+    if kind == "video" and (not payload or not payload.get("play_url")):
+        detail = _douyin_payload_from_web_detail(aweme_id)
+        if detail:
+            payload = detail
 
     if not payload:
         info = {"title": "", "author": "", "duration": 0, "description": ""}

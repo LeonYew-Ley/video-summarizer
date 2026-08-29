@@ -15,7 +15,7 @@ Extract video transcripts or image-text posts, then write structured notes. No l
 |---|---|---|
 | Bilibili (B站) | `bilibili.com/video/`, `b23.tv/`, `BV*` | Public API (WBI signing) |
 | YouTube | `youtube.com/watch`, `youtu.be/`, `youtube.com/shorts/` | `youtube-transcript-api` |
-| Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | Share page / public SEO snapshot (notes) or `yt-dlp` (video) |
+| Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | Share page / public SEO snapshot (notes) or public web detail + Whisper (video) |
 | Xiaohongshu (小红书) | `xiaohongshu.com/`, `xhslink.com/` | Page parse (video or post) |
 | Weixin (公众号) | `mp.weixin.qq.com/` | Public free article HTML |
 | TikTok | `tiktok.com/` | `yt-dlp` |
