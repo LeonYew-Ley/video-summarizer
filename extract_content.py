@@ -19,6 +19,7 @@ Video fallback chain:
 import glob
 import gzip
 import hashlib
+import html as html_lib
 import io
 import json
 import os
@@ -32,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from functools import reduce
+from html.parser import HTMLParser
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
@@ -156,6 +158,9 @@ PLATFORM_PATTERNS = [
     ]),
     ("tiktok", [
         r"tiktok\.com/",
+    ]),
+    ("weixin", [
+        r"mp\.weixin\.qq\.com/",
     ]),
 ]
 
@@ -940,18 +945,57 @@ XHS_MOBILE_UA = (
     "Mobile/15E148 Safari/604.1"
 )
 
+XHS_DESKTOP_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+    "upgrade-insecure-requests": "1",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _follow_location(url, headers, max_hops=5):
+    """Read Location like nfe-w (maxRedirects: 0) instead of auto-following."""
+    current = url
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(max_hops):
+        req = urllib.request.Request(current, headers=headers)
+        try:
+            with opener.open(req, timeout=15) as resp:
+                return resp.url, resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            location = e.headers.get("Location")
+            if e.code in (301, 302, 303, 307, 308) and location:
+                current = urllib.parse.urljoin(current, location)
+                continue
+            raise
+    return current, None
+
 
 def _resolve_xhs_url(url):
     """Resolve xhslink.com short link and extract note ID."""
     url = _normalize_input_url(url)
+    html = None
+    resolved = url
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": XHS_MOBILE_UA,
-            "Accept": "text/html,*/*",
-        })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resolved = resp.url
-            html = resp.read().decode("utf-8", errors="replace")
+        if re.search(r"xhslink\.com", url):
+            resolved, html = _follow_location(url, XHS_DESKTOP_HEADERS)
+        if html is None:
+            req = urllib.request.Request(url if resolved == url else resolved, headers=XHS_DESKTOP_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resolved = resp.url
+                html = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         log(f"Failed to resolve XHS URL: {e}", "WARN")
         return None, None, url
@@ -1077,7 +1121,16 @@ def extract_xiaohongshu(url):
     """Extract Xiaohongshu video or image note via mobile page HTML."""
     note_id, html, resolved_url = _resolve_xhs_url(url)
 
-    if html and ("/404" in resolved_url or "error_code=300031" in html):
+    blocked = (
+        html
+        and (
+            "/404" in resolved_url
+            or "error_code=300031" in html
+            or "undertake_note_error" in resolved_url
+            or "该内容暂时无法查看" in urllib.parse.unquote(resolved_url)
+        )
+    )
+    if blocked:
         return _make_post_result(
             {"title": "", "author": "", "duration": 0, "description": ""},
             "xiaohongshu",
@@ -1184,6 +1237,146 @@ def extract_douyin(url):
     result = _make_result(info, "douyin", resolved_url)
     result["_play_url"] = payload.get("play_url")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Weixin public article extractor
+# ---------------------------------------------------------------------------
+
+WEIXIN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://mp.weixin.qq.com/",
+}
+
+WEIXIN_BLOCKED_MARKERS = (
+    'id="js_verify"',
+    'id="verify_code"',
+    "is_pay_subscribe: '1'",
+    'is_pay_subscribe: "1"',
+    "付费阅读",
+    "此内容需关注",
+    "关注后才能阅读",
+    "关注后可查看",
+    "关注公众号后阅读",
+    "环境异常",
+    "完成验证后即可继续访问",
+)
+
+
+class _WeixinContentParser(HTMLParser):
+    """Collect visible text and image URLs from #js_content."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_content = False
+        self.depth = 0
+        self.parts = []
+        self.images = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if not self.in_content:
+            if attrs.get("id") == "js_content":
+                self.in_content = True
+                self.depth = 1
+            return
+        if tag == "div":
+            self.depth += 1
+        if tag in ("p", "br", "h1", "h2", "h3", "h4", "li", "section"):
+            self.parts.append("\n")
+        if tag == "img":
+            src = attrs.get("data-src") or attrs.get("data-original") or attrs.get("src")
+            if src and src.startswith("http"):
+                self.images.append(src)
+
+    def handle_endtag(self, tag):
+        if self.in_content and tag == "div":
+            self.depth -= 1
+            if self.depth <= 0:
+                self.in_content = False
+
+    def handle_data(self, data):
+        if self.in_content:
+            text = data.strip()
+            if text:
+                self.parts.append(text)
+
+
+def _weixin_blocked_reason(html):
+    if not html:
+        return "empty page"
+    for marker in WEIXIN_BLOCKED_MARKERS:
+        if marker in html:
+            return marker
+    if "js_content" not in html and ("verify" in html.lower() or "captcha" in html.lower()):
+        return "verification page"
+    return None
+
+
+def _weixin_meta(html, pattern):
+    match = re.search(pattern, html or "", re.I | re.DOTALL)
+    if not match:
+        return ""
+    return html_lib.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+
+
+def extract_weixin(url):
+    """Extract a public free Weixin article. Blocked/paid/verify pages hard-fail."""
+    url = _normalize_input_url(url)
+    try:
+        html = http_get(url, headers=WEIXIN_HEADERS)
+    except Exception as e:
+        return _make_post_result(
+            {"title": "", "author": "", "duration": 0, "description": ""},
+            "weixin",
+            url,
+            error=f"Failed to fetch Weixin article: {e}",
+        )
+
+    blocked = _weixin_blocked_reason(html)
+    if blocked:
+        return _make_post_result(
+            {"title": "", "author": "", "duration": 0, "description": ""},
+            "weixin",
+            url,
+            error=f"Weixin article is not publicly readable ({blocked})",
+        )
+
+    title = (
+        _weixin_meta(html, r'id="activity-name"[^>]*>(.*?)</')
+        or _weixin_meta(html, r'property="og:title"\s+content="([^"]+)"')
+    )
+    author = (
+        _weixin_meta(html, r'id="js_name"[^>]*>(.*?)</')
+        or _weixin_meta(html, r'id="js_author_name"[^>]*>(.*?)</')
+        or _weixin_meta(html, r'property="og:article:author"\s+content="([^"]+)"')
+        or _weixin_meta(html, r'id="js_profile_qrcode"[^>]*data-nickname="([^"]+)"')
+    )
+    parser = _WeixinContentParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    body = re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+    info = {
+        "title": title,
+        "author": author,
+        "duration": 0,
+        "description": body,
+    }
+    return _finalize_post(
+        info,
+        "weixin",
+        url,
+        parser.images,
+        referer="https://mp.weixin.qq.com/",
+        user_agent=WEIXIN_HEADERS["User-Agent"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2053,6 +2246,8 @@ def extract(url, config):
         result = extract_douyin(url)
     elif platform == "xiaohongshu":
         result = extract_xiaohongshu(url)
+    elif platform == "weixin":
+        result = extract_weixin(url)
 
     if result:
         play_url = result.get("_play_url")

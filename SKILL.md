@@ -16,7 +16,8 @@ Extract video transcripts or image-text posts, then write structured notes. No l
 | Bilibili (B站) | `bilibili.com/video/`, `b23.tv/`, `BV*` | Public API (WBI signing) |
 | YouTube | `youtube.com/watch`, `youtu.be/`, `youtube.com/shorts/` | `youtube-transcript-api` |
 | Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | `yt-dlp` |
-| Xiaohongshu (小红书) | `xiaohongshu.com/`, `xhslink.com/` | `yt-dlp` |
+| Xiaohongshu (小红书) | `xiaohongshu.com/`, `xhslink.com/` | Page parse (video or post) |
+| Weixin (公众号) | `mp.weixin.qq.com/` | Public free article HTML |
 | TikTok | `tiktok.com/` | `yt-dlp` |
 | Any other | Any URL supported by yt-dlp (1800+ sites) | `yt-dlp` |
 
@@ -192,7 +193,42 @@ Guidelines for summarization:
 
 ### Step 4b: Post Notes
 
-Use a separate post template (no video timeline, no spoken-word assumptions). Prefer: title + link + author; caption / body points; figure-by-figure notes with embedded local images; overall summary. If the model cannot read images, say so first, then summarize only from `subtitle_text`. If `images_truncated` is true, say later images were omitted. Full post-template details will expand with the Xiaohongshu / Douyin / Weixin extractors.
+Use this **separate** post template. Do not reuse the video template. No timestamps, no spoken-word / 口播 assumptions.
+
+If the model cannot read images, say so in the first paragraph, then summarize only from `subtitle_text`. Do not invent figure content. If `images_truncated` is true, say later images were omitted.
+
+```markdown
+# 图文总结：[{title}]({url})
+
+作者：{author} · {platform}
+
+### 原文要点
+- {caption / body points from subtitle_text}
+
+### 图 1
+![{title} 图1]({images[0].path})
+- {what this figure shows}
+
+### 图 2
+![{title} 图2]({images[1].path})
+- {what this figure shows}
+
+(... 图 3…N in order ...)
+
+### Summary
+- {one paragraph overall}
+
+### Highlights
+*   {highlight with emoji} [#tag1] [#tag2] [#tag3]
+*   {highlight}
+*   {highlight}
+
+[#tag1] [#tag2] [#tag3] [#tag4] [#tag5]
+
+### Questions
+*   {follow-up question}
+*   {follow-up question}
+```
 
 ## Whisper Setup (Optional)
 
