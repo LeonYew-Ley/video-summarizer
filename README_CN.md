@@ -57,7 +57,7 @@ git clone https://github.com/keepongo/video-summarizer.git \
 
 ### AI 如何发现此 Skill
 
-Cursor 和 Claude 会自动扫描 skills 目录下包含 `SKILL.md` 的文件夹。当你粘贴视频链接（如 `bilibili.com`、`youtube.com`、`douyin.com`），AI 会读取 `SKILL.md` 中的说明，调用 `video_subtitle.py` 提取字幕，然后按照模板格式化输出。无需手动激活。
+Cursor 和 Claude 会自动扫描 skills 目录下包含 `SKILL.md` 的文件夹。当你粘贴视频链接（如 `bilibili.com`、`youtube.com`、`douyin.com`），AI 会读取 `SKILL.md` 中的说明，调用 `extract_content.py` 提取字幕，然后按照模板格式化输出。无需手动激活。
 
 ## 依赖安装
 
@@ -188,7 +188,7 @@ sudo apt install ffmpeg
 
 ## 输出格式
 
-提取脚本（`video_subtitle.py`）将 JSON 输出到 stdout：
+提取脚本（`extract_content.py`）将 JSON 输出到 stdout：
 
 ```json
 {
@@ -220,7 +220,7 @@ AI 会将 JSON 转换为结构化 Markdown 总结，包含章节标题、亮点�
 ```
 multi-video-summarizer/
 ├── SKILL.md              # Skill 定义文件（触发 AI 发现）
-├── video_subtitle.py     # 核心提取脚本（约1500行）
+├── extract_content.py     # 核心提取脚本（约1500行）
 ├── config.json           # 用户配置
 ├── requirements.txt      # pip 依赖清单
 ├── README.md             # 英文文档
@@ -236,19 +236,19 @@ multi-video-summarizer/
 也可以直接在命令行运行脚本：
 
 ```bash
-python video_subtitle.py "https://www.bilibili.com/video/BV1xxxxxx"
+python extract_content.py "https://www.bilibili.com/video/BV1xxxxxx"
 ```
 
 输出 JSON 到 stdout。配合 `jq` 快速查看：
 
 ```bash
-python video_subtitle.py "https://youtu.be/xxxxx" | jq '.title, .source'
+python extract_content.py "https://youtu.be/xxxxx" | jq '.title, .source'
 ```
 
 清除所有缓存结果和截图：
 
 ```bash
-python video_subtitle.py --clear-cache
+python extract_content.py --clear-cache
 ```
 
 ## 常见问题
@@ -262,7 +262,7 @@ python video_subtitle.py --clear-cache
 | 找不到 `yt-dlp` | 执行 `pip install yt-dlp`；如果已安装但不在 PATH 中，脚本会自动尝试 `python -m yt_dlp` |
 | 找不到 ffmpeg / 没有截图 | 安装 ffmpeg（参见 [安装 ffmpeg](#安装-ffmpeg)）。截图功能是可选的，未安装时会自动跳过 |
 | Whisper 模型下载卡住 | 检查网络连接。本地模型首次使用时从 Hugging Face 下载 |
-| 缓存结果过时/不准确 | 缓存默认 7 天过期（可通过 `cache_ttl_days` 配置）。手动清除：`python video_subtitle.py --clear-cache` |
+| 缓存结果过时/不准确 | 缓存默认 7 天过期（可通过 `cache_ttl_days` 配置）。手动清除：`python extract_content.py --clear-cache` |
 
 ## 许可证
 

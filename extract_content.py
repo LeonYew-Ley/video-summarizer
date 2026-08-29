@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Multi-Platform Video Subtitle Extractor
-Extracts subtitles/transcripts from multiple video platforms for AI summarization.
+Social Summarizer content extractor.
+Extracts video transcripts or image-text posts for AI summarization.
 
 Supported platforms:
   - Bilibili (public API with WBI signing)
   - YouTube (youtube-transcript-api or yt-dlp)
   - Douyin / TikTok (yt-dlp)
-  - Xiaohongshu (yt-dlp)
+  - Xiaohongshu (page parse / yt-dlp)
   - Any yt-dlp supported site (1800+ sites)
 
-Fallback chain:
+Video fallback chain:
   1. Platform-specific subtitle API (free, no auth)
   2. yt-dlp subtitle extraction
   3. yt-dlp audio download + Whisper ASR (local or API)
@@ -41,6 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 SCREENSHOTS_DIR = os.path.join(SCRIPT_DIR, "screenshots")
+IMAGES_DIR = os.path.join(SCRIPT_DIR, "images")
 COOKIES_PATHS = [
     os.path.join(SCRIPT_DIR, "cookies.txt"),
     os.path.join(SCRIPT_DIR, "www.douyin.com_cookies.txt"),
@@ -261,6 +262,64 @@ def _extract_bvid(url_or_bvid):
     return None
 
 
+def _make_cue(start, end, text):
+    """Build a timed cue dict. start/end are seconds. Returns None if unusable."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        start = float(start)
+        end = float(end) if end is not None else start
+    except (TypeError, ValueError):
+        return None
+    if end < start:
+        end = start
+    return {"start": round(start, 3), "end": round(end, 3), "text": text}
+
+
+def _timestamp_to_seconds(value):
+    """Parse VTT/SRT timestamps like 00:01:02.500 or 01:02,500 into seconds."""
+    if value is None:
+        return None
+    value = str(value).strip().replace(",", ".")
+    value = re.split(r"\s+", value, maxsplit=1)[0]
+    parts = value.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 1:
+            return float(parts[0])
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _cues_from_segments(segments, time_offset=0.0):
+    """Normalize Whisper/API segment objects into (text, cues)."""
+    lines = []
+    cues = []
+    for seg in segments or []:
+        if isinstance(seg, dict):
+            text = (seg.get("text") or "").strip()
+            start = seg.get("start", 0)
+            end = seg.get("end", start)
+        else:
+            text = (getattr(seg, "text", "") or "").strip()
+            start = getattr(seg, "start", 0)
+            end = getattr(seg, "end", start)
+        if not text:
+            continue
+        lines.append(text)
+        cue = _make_cue(float(start) + time_offset, float(end) + time_offset, text)
+        if cue:
+            cues.append(cue)
+    if not lines:
+        return None, []
+    return "\n".join(lines), cues
+
+
 def _bili_parse_subtitle_list(subtitles):
     urls = []
     for sub in subtitles:
@@ -277,17 +336,29 @@ def _bili_parse_subtitle_list(subtitles):
 
 
 def _bili_download_subtitle(url):
+    """Return (text, cues) from a Bilibili subtitle JSON URL."""
     try:
         text = http_get(url, headers=BILI_HEADERS)
         data = json.loads(text)
         body = data.get("body", [])
         if not body:
-            return None
-        lines = [item.get("content", "").strip() for item in body]
-        return "\n".join(line for line in lines if line)
+            return None, []
+        lines = []
+        cues = []
+        for item in body:
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            lines.append(content)
+            cue = _make_cue(item.get("from"), item.get("to"), content)
+            if cue:
+                cues.append(cue)
+        if not lines:
+            return None, []
+        return "\n".join(lines), cues
     except Exception as e:
         log(f"Failed to download subtitle: {e}", "ERROR")
-        return None
+        return None, []
 
 
 def _bili_pick_and_download(subtitle_urls):
@@ -295,14 +366,14 @@ def _bili_pick_and_download(subtitle_urls):
     for lang in preferred_langs:
         for sub in subtitle_urls:
             if lang in sub["lang"]:
-                text = _bili_download_subtitle(sub["url"])
+                text, cues = _bili_download_subtitle(sub["url"])
                 if text:
-                    return text, sub["lang_doc"]
+                    return text, cues, sub["lang_doc"]
     for sub in subtitle_urls:
-        text = _bili_download_subtitle(sub["url"])
+        text, cues = _bili_download_subtitle(sub["url"])
         if text:
-            return text, sub["lang_doc"]
-    return None, None
+            return text, cues, sub["lang_doc"]
+    return None, [], None
 
 
 def extract_bilibili(url):
@@ -399,9 +470,9 @@ def extract_bilibili(url):
 
     # Download best subtitle
     if subtitle_urls:
-        text, lang = _bili_pick_and_download(subtitle_urls)
+        text, cues, lang = _bili_pick_and_download(subtitle_urls)
         if text:
-            return _make_result(info, "bilibili", url, text, "subtitle")
+            return _make_result(info, "bilibili", url, text, "subtitle", cues=cues)
 
     # Method 5: B站 AI conclusion API
     if aid and cid and mid:
@@ -483,17 +554,31 @@ def extract_youtube(url):
             if transcript:
                 fetched = transcript.fetch()
                 lines = []
+                cues = []
                 for entry in fetched:
                     if isinstance(entry, dict):
-                        lines.append(entry.get("text", "").strip())
+                        text_line = (entry.get("text") or "").strip()
+                        start = entry.get("start", 0)
+                        duration = entry.get("duration", 0) or 0
                     elif hasattr(entry, "text"):
-                        lines.append(entry.text.strip())
+                        text_line = (entry.text or "").strip()
+                        start = getattr(entry, "start", 0)
+                        duration = getattr(entry, "duration", 0) or 0
                     else:
-                        lines.append(str(entry).strip())
-                text = "\n".join(line for line in lines if line)
+                        text_line = str(entry).strip()
+                        start = None
+                        duration = 0
+                    if not text_line:
+                        continue
+                    lines.append(text_line)
+                    if start is not None:
+                        cue = _make_cue(start, float(start) + float(duration), text_line)
+                        if cue:
+                            cues.append(cue)
+                text = "\n".join(lines)
                 if text:
                     _fill_youtube_info(info, video_id)
-                    return _make_result(info, "youtube", canonical_url, text, "transcript_api")
+                    return _make_result(info, "youtube", canonical_url, text, "transcript_api", cues=cues)
         except Exception as e:
             log(f"youtube-transcript-api failed: {e}", "WARN")
     except ImportError:
@@ -1032,7 +1117,7 @@ def _ytdlp_extract_subs(url, tmp_dir, platform="generic"):
         _run_ytdlp(cmd)
     except Exception as e:
         log(f"yt-dlp subtitle download failed: {e}", "WARN")
-        return None
+        return None, []
 
     sub_files = (
         glob.glob(os.path.join(tmp_dir, "*.vtt"))
@@ -1041,26 +1126,26 @@ def _ytdlp_extract_subs(url, tmp_dir, platform="generic"):
         + glob.glob(os.path.join(tmp_dir, "*.srv3"))
     )
     if not sub_files:
-        return None
+        return None, []
 
     for sf in sub_files:
-        text = _parse_subtitle_file(sf)
+        text, cues = _parse_subtitle_file(sf)
         if text:
-            return text
-    return None
+            return text, cues
+    return None, []
 
 
 def _parse_subtitle_file(filepath):
-    """Parse VTT/SRT/JSON3 subtitle file into plain text."""
+    """Parse VTT/SRT/JSON3/SRV3 subtitle file into (text, cues)."""
     ext = os.path.splitext(filepath)[1].lower()
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
     except Exception:
-        return None
+        return None, []
 
     if not content.strip():
-        return None
+        return None, []
 
     if ext == ".json3":
         return _parse_json3_subtitle(content)
@@ -1068,7 +1153,7 @@ def _parse_subtitle_file(filepath):
         return _parse_vtt_srt(content)
     elif ext == ".srv3":
         return _parse_srv3_subtitle(content)
-    return None
+    return None, []
 
 
 def _parse_json3_subtitle(content):
@@ -1076,47 +1161,79 @@ def _parse_json3_subtitle(content):
         data = json.loads(content)
         events = data.get("events", [])
         lines = []
+        cues = []
         for event in events:
             segs = event.get("segs", [])
-            text = "".join(s.get("utf8", "") for s in segs).strip()
-            if text and text != "\n":
-                lines.append(text)
-        return "\n".join(lines) if lines else None
+            text = "".join(s.get("utf8", "") or "" for s in segs).strip()
+            if not text or text == "\n":
+                continue
+            lines.append(text)
+            start_ms = event.get("tStartMs")
+            dur_ms = event.get("dDurationMs") or 0
+            if start_ms is not None:
+                cue = _make_cue(start_ms / 1000.0, (start_ms + dur_ms) / 1000.0, text)
+                if cue:
+                    cues.append(cue)
+        return ("\n".join(lines) if lines else None), cues
     except Exception:
-        return None
+        return None, []
 
 
 def _parse_srv3_subtitle(content):
     lines = []
-    for match in re.findall(r'<p[^>]*>(.*?)</p>', content, re.DOTALL):
-        text = re.sub(r'<[^>]+>', '', match).strip()
-        if text:
-            lines.append(text)
-    return "\n".join(lines) if lines else None
+    cues = []
+    for match in re.finditer(r"<p([^>]*)>(.*?)</p>", content, re.DOTALL):
+        attrs, inner = match.group(1), match.group(2)
+        text = re.sub(r"<[^>]+>", "", inner).strip()
+        if not text:
+            continue
+        lines.append(text)
+        t_match = re.search(r'\bt="(\d+)"', attrs)
+        d_match = re.search(r'\bd="(\d+)"', attrs)
+        if t_match:
+            start = int(t_match.group(1)) / 1000.0
+            duration = int(d_match.group(1)) / 1000.0 if d_match else 0
+            cue = _make_cue(start, start + duration, text)
+            if cue:
+                cues.append(cue)
+    return ("\n".join(lines) if lines else None), cues
 
 
 def _parse_vtt_srt(content):
     lines = []
+    cues = []
     seen = set()
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
+    blocks = re.split(r"\n\s*\n", content.replace("\r\n", "\n").strip())
+    for block in blocks:
+        timing = None
+        text_lines = []
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if re.match(r"^\d+$", line):
+                continue
+            if re.match(r"^WEBVTT", line):
+                continue
+            if re.match(r"^NOTE\b", line):
+                continue
+            timed = re.search(r"([\d:,.]+)\s*-->\s*([\d:,.]+)", line)
+            if timed:
+                timing = timed
+                continue
+            text_lines.append(re.sub(r"<[^>]+>", "", line).strip())
+        text = " ".join(t for t in text_lines if t)
+        if not text or text in seen:
             continue
-        if re.match(r'^\d+$', line):
-            continue
-        if re.match(r'^WEBVTT', line):
-            continue
-        if re.match(r'^NOTE\s', line):
-            continue
-        if re.match(r'^\d{2}:\d{2}', line):
-            continue
-        if '-->' in line:
-            continue
-        text = re.sub(r'<[^>]+>', '', line).strip()
-        if text and text not in seen:
-            seen.add(text)
-            lines.append(text)
-    return "\n".join(lines) if lines else None
+        seen.add(text)
+        lines.append(text)
+        if timing:
+            start = _timestamp_to_seconds(timing.group(1))
+            end = _timestamp_to_seconds(timing.group(2))
+            cue = _make_cue(start, end, text)
+            if cue:
+                cues.append(cue)
+    return ("\n".join(lines) if lines else None), cues
 
 
 def _ytdlp_download_audio(url, tmp_dir, platform="generic"):
@@ -1347,9 +1464,9 @@ def extract_with_ytdlp(url, platform="generic"):
     tmp_dir = tempfile.mkdtemp(prefix="video_sub_")
     try:
         log(f"Trying yt-dlp subtitle extraction for {platform}...")
-        text = _ytdlp_extract_subs(url, tmp_dir, platform)
+        text, cues = _ytdlp_extract_subs(url, tmp_dir, platform)
         if text:
-            return _make_result(info, platform, url, text, "yt_dlp_subs")
+            return _make_result(info, platform, url, text, "yt_dlp_subs", cues=cues)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1390,16 +1507,16 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
             return None
 
         if whisper_mode == "api":
-            text = _whisper_api(audio_path, config)
+            text, cues = _whisper_api(audio_path, config)
         elif whisper_mode == "local":
-            text = _whisper_local(audio_path, config)
+            text, cues = _whisper_local(audio_path, config)
         else:
             log(f"Unknown whisper_mode: {whisper_mode}", "ERROR")
             return None
 
         if text:
             source = f"whisper_{whisper_mode}"
-            return _make_result(info, platform, url, text, source)
+            return _make_result(info, platform, url, text, source, cues=cues)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1407,11 +1524,11 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
 
 
 def _whisper_api(audio_path, config):
-    """Transcribe using OpenAI Whisper API."""
+    """Transcribe using OpenAI Whisper API. Returns (text, cues)."""
     api_key = config.get("openai_api_key", "")
     if not api_key:
         log("openai_api_key not configured in config.json", "ERROR")
-        return None
+        return None, []
 
     try:
         from openai import OpenAI
@@ -1430,23 +1547,43 @@ def _whisper_api(audio_path, config):
                 model="whisper-1",
                 file=f,
                 language=language,
-                response_format="text",
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
             )
-        return resp if isinstance(resp, str) else str(resp)
+        return _whisper_response_to_payload(resp)
     except ImportError:
         log("openai package not installed. Run: pip install openai", "ERROR")
     except Exception as e:
         log(f"Whisper API failed: {e}", "ERROR")
-    return None
+    return None, []
+
+
+def _whisper_response_to_payload(resp, time_offset=0.0):
+    """Normalize an OpenAI transcription response into (text, cues)."""
+    if resp is None:
+        return None, []
+    if isinstance(resp, str):
+        text = resp.strip()
+        return (text or None), []
+    segments = getattr(resp, "segments", None)
+    if segments is None and isinstance(resp, dict):
+        segments = resp.get("segments")
+    if segments:
+        return _cues_from_segments(segments, time_offset=time_offset)
+    text = getattr(resp, "text", None)
+    if text is None and isinstance(resp, dict):
+        text = resp.get("text")
+    text = (text or "").strip()
+    return (text or None), []
 
 
 def _whisper_api_chunked(audio_path, client, language):
-    """Split large audio and transcribe in chunks."""
+    """Split large audio and transcribe in chunks. Returns (text, cues)."""
     try:
         from pydub import AudioSegment
     except ImportError:
         log("pydub not installed, cannot split audio. Run: pip install pydub", "ERROR")
-        return None
+        return None, []
 
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -1454,6 +1591,7 @@ def _whisper_api_chunked(audio_path, client, language):
         chunks = [audio[i:i + chunk_ms] for i in range(0, len(audio), chunk_ms)]
 
         parts = []
+        cues = []
         for i, chunk in enumerate(chunks):
             log(f"Transcribing chunk {i + 1}/{len(chunks)}...")
             chunk_path = audio_path + f".chunk{i}.m4a"
@@ -1463,26 +1601,30 @@ def _whisper_api_chunked(audio_path, client, language):
                     model="whisper-1",
                     file=f,
                     language=language,
-                    response_format="text",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
                 )
-            text = resp if isinstance(resp, str) else str(resp)
+            text, chunk_cues = _whisper_response_to_payload(resp, time_offset=i * 600)
             if text:
                 parts.append(text.strip())
+            cues.extend(chunk_cues)
             os.unlink(chunk_path)
 
-        return "\n".join(parts) if parts else None
+        if not parts:
+            return None, []
+        return "\n".join(parts), cues
     except Exception as e:
         log(f"Chunked transcription failed: {e}", "ERROR")
-        return None
+        return None, []
 
 
 def _whisper_local(audio_path, config):
-    """Transcribe using faster-whisper (local model)."""
+    """Transcribe using faster-whisper (local model). Returns (text, cues)."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         log("faster-whisper not installed. Run: pip install faster-whisper", "ERROR")
-        return None
+        return None, []
 
     model_size = config.get("whisper_model", "base")
     language = config.get("language", "zh")
@@ -1491,11 +1633,10 @@ def _whisper_local(audio_path, config):
     try:
         model = WhisperModel(model_size, device="auto", compute_type="auto")
         segments, _ = model.transcribe(audio_path, language=language)
-        lines = [seg.text.strip() for seg in segments if seg.text.strip()]
-        return "\n".join(lines) if lines else None
+        return _cues_from_segments(segments)
     except Exception as e:
         log(f"Local Whisper transcription failed: {e}", "ERROR")
-        return None
+        return None, []
 
 
 # ---------------------------------------------------------------------------
@@ -1511,15 +1652,19 @@ def format_duration(seconds):
     return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
-def _make_result(info, platform, url, subtitle_text=None, source=None, error=None):
-    return {
+def _make_result(info, platform, url, subtitle_text=None, source=None, error=None, cues=None):
+    result = {
         "info": info,
         "platform": platform,
         "url": url,
         "subtitle_text": subtitle_text,
         "source": source,
         "error": error,
+        "content_type": "video",
     }
+    if cues:
+        result["cues"] = cues
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1569,9 +1714,12 @@ def extract(url, config):
                 if ytdlp_result.get("subtitle_text"):
                     if not info.get("title") and ytdlp_result["info"].get("title"):
                         info = ytdlp_result["info"]
-                    final_result = _make_result(info, platform, url,
-                                                ytdlp_result["subtitle_text"],
-                                                ytdlp_result["source"])
+                    final_result = _make_result(
+                        info, platform, url,
+                        ytdlp_result["subtitle_text"],
+                        ytdlp_result["source"],
+                        cues=ytdlp_result.get("cues"),
+                    )
                 if not info.get("title") and ytdlp_result["info"].get("title"):
                     info = ytdlp_result["info"]
         else:
@@ -1616,9 +1764,9 @@ def extract(url, config):
 
 
 def _clear_cache():
-    """Remove all cached results and screenshots."""
+    """Remove cached results, screenshots, and downloaded images."""
     removed = 0
-    for d in [CACHE_DIR, SCREENSHOTS_DIR]:
+    for d in [CACHE_DIR, SCREENSHOTS_DIR, IMAGES_DIR]:
         if os.path.isdir(d):
             removed += sum(len(files) for _, _, files in os.walk(d))
             shutil.rmtree(d, ignore_errors=True)
@@ -1631,15 +1779,15 @@ def main():
         return
 
     if len(sys.argv) < 2:
-        print("Usage: python video_subtitle.py <URL>", file=sys.stderr)
-        print("       python video_subtitle.py --clear-cache", file=sys.stderr)
-        print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, and 1800+ sites", file=sys.stderr)
+        print("Usage: python extract_content.py <URL>", file=sys.stderr)
+        print("       python extract_content.py --clear-cache", file=sys.stderr)
+        print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, Weixin, and 1800+ sites", file=sys.stderr)
         sys.exit(1)
 
     url = sys.argv[1]
     config = load_config()
 
-    log(f"Extracting subtitles for: {url}")
+    log(f"Extracting content for: {url}")
     result = extract(url, config)
 
     if not result:
@@ -1648,6 +1796,7 @@ def main():
 
     info = result.get("info", {})
     output = {
+        "content_type": result.get("content_type", "video"),
         "title": info.get("title", ""),
         "author": info.get("author", ""),
         "duration": format_duration(info.get("duration", 0)),
@@ -1663,6 +1812,9 @@ def main():
 
     output["source"] = result.get("source", "unknown")
     output["subtitle_text"] = result["subtitle_text"]
+
+    if result.get("cues"):
+        output["cues"] = result["cues"]
 
     if result.get("frames"):
         output["frames"] = [

@@ -57,7 +57,7 @@ git clone https://github.com/keepongo/video-summarizer.git \
 
 ### How the AI Discovers the Skill
 
-Cursor and Claude automatically scan their skills directories for folders containing a `SKILL.md` file. When you paste a video URL (e.g., `bilibili.com`, `youtube.com`, `douyin.com`), the AI reads `SKILL.md`, which tells it how to run `video_subtitle.py` and format the output. No manual activation is needed.
+Cursor and Claude automatically scan their skills directories for folders containing a `SKILL.md` file. When you paste a video URL (e.g., `bilibili.com`, `youtube.com`, `douyin.com`), the AI reads `SKILL.md`, which tells it how to run `extract_content.py` and format the output. No manual activation is needed.
 
 ## Dependencies
 
@@ -188,7 +188,7 @@ The script auto-detects cookie files named `cookies.txt`, `www.douyin.com_cookie
 
 ## Output Format
 
-The extraction script (`video_subtitle.py`) outputs JSON to stdout:
+The extraction script (`extract_content.py`) outputs JSON to stdout:
 
 ```json
 {
@@ -220,7 +220,7 @@ The AI then transforms this into a structured markdown summary with section head
 ```
 multi-video-summarizer/
 ├── SKILL.md              # Skill definition (triggers AI discovery)
-├── video_subtitle.py     # Core extraction script (~1500 lines)
+├── extract_content.py     # Core extraction script (~1500 lines)
 ├── config.json           # User configuration
 ├── requirements.txt      # pip dependencies list
 ├── README.md             # English documentation
@@ -236,19 +236,19 @@ multi-video-summarizer/
 You can also run the script directly from the command line:
 
 ```bash
-python video_subtitle.py "https://www.bilibili.com/video/BV1xxxxxx"
+python extract_content.py "https://www.bilibili.com/video/BV1xxxxxx"
 ```
 
 This outputs the JSON result to stdout. Combine with `jq` for quick inspection:
 
 ```bash
-python video_subtitle.py "https://youtu.be/xxxxx" | jq '.title, .source'
+python extract_content.py "https://youtu.be/xxxxx" | jq '.title, .source'
 ```
 
 Clear all cached results and screenshots:
 
 ```bash
-python video_subtitle.py --clear-cache
+python extract_content.py --clear-cache
 ```
 
 ## Troubleshooting
@@ -262,7 +262,7 @@ python video_subtitle.py --clear-cache
 | `yt-dlp` not found | Run `pip install yt-dlp`, or if installed but not on PATH, the script falls back to `python -m yt_dlp` |
 | ffmpeg not found / no screenshots | Install ffmpeg (see [Install ffmpeg](#install-ffmpeg)). Frame extraction is optional and skipped gracefully |
 | Whisper model download hangs | Check your network connection. Local models download from Hugging Face on first use |
-| Stale/outdated cached result | Cache expires after 7 days by default (configurable via `cache_ttl_days`). To force refresh, run `python video_subtitle.py --clear-cache` |
+| Stale/outdated cached result | Cache expires after 7 days by default (configurable via `cache_ttl_days`). To force refresh, run `python extract_content.py --clear-cache` |
 
 ## License
 
