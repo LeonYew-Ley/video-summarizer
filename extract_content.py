@@ -233,6 +233,7 @@ BILI_HEADERS = {
 
 API_VIDEO_VIEW = "https://api.bilibili.com/x/web-interface/view"
 API_PLAYER_V2 = "https://api.bilibili.com/x/player/wbi/v2"
+API_PLAYURL = "https://api.bilibili.com/x/player/playurl"
 API_NAV = "https://api.bilibili.com/x/web-interface/nav"
 API_CONCLUSION = "https://api.bilibili.com/x/web-interface/view/conclusion/get"
 
@@ -387,6 +388,56 @@ def _bili_download_subtitle(url):
         return None, []
 
 
+def _bili_play_url(bvid, cid):
+    """Guest playurl (low-q mp4). Used for Whisper when yt-dlp hits 412."""
+    if not bvid or not cid:
+        return None
+    params = {
+        "bvid": bvid, "cid": cid, "qn": 16, "fnval": 1, "fnver": 0, "fourk": 0,
+    }
+    img_key, sub_key = _get_wbi_keys()
+    if img_key and sub_key:
+        params = _sign_wbi(params, img_key, sub_key)
+    resp = api_request(API_PLAYURL, params=params, headers=BILI_HEADERS)
+    if not resp or resp.get("code") != 0:
+        return None
+    data = resp.get("data") or {}
+    for item in data.get("durl") or []:
+        url = item.get("url") or item.get("backup_url")
+        if isinstance(url, list):
+            url = url[0] if url else None
+        if url:
+            return url
+    dash = data.get("dash") or {}
+    for stream in (dash.get("audio") or []) + (dash.get("video") or []):
+        url = stream.get("baseUrl") or stream.get("base_url")
+        if url:
+            return url
+    return None
+
+
+def _download_bili_media(play_url, tmp_dir):
+    """Download Bilibili CDN media with guest Referer. Returns path or None."""
+    if not play_url:
+        return None
+    try:
+        dest = os.path.join(tmp_dir, "bili_media.mp4")
+        req = urllib.request.Request(play_url, headers=BILI_HEADERS)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if os.path.exists(dest) and os.path.getsize(dest) > 1000:
+            log(f"Downloaded Bilibili media: {os.path.getsize(dest) // 1024}KB")
+            return dest
+    except Exception as e:
+        log(f"Bilibili direct download failed: {e}", "WARN")
+    return None
+
+
 def _bili_pick_and_download(subtitle_urls):
     preferred_langs = ["zh-CN", "zh-Hans", "ai-zh", "zh"]
     for lang in preferred_langs:
@@ -494,11 +545,15 @@ def extract_bilibili(url):
                         if subtitle_urls:
                             break
 
+    play_url = _bili_play_url(bvid, cid)
+
     # Download best subtitle
     if subtitle_urls:
         text, cues, lang = _bili_pick_and_download(subtitle_urls)
         if text:
-            return _make_result(info, "bilibili", url, text, "subtitle", cues=cues)
+            result = _make_result(info, "bilibili", url, text, "subtitle", cues=cues)
+            result["_play_url"] = play_url
+            return result
 
     # Method 5: B站 AI conclusion API
     if aid and cid and mid:
@@ -524,9 +579,13 @@ def extract_bilibili(url):
                         if content:
                             parts.append(f"- {content}")
                 if parts:
-                    return _make_result(info, "bilibili", url, "\n".join(parts), "ai_conclusion")
+                    result = _make_result(info, "bilibili", url, "\n".join(parts), "ai_conclusion")
+                    result["_play_url"] = play_url
+                    return result
 
-    return _make_result(info, "bilibili", url)
+    result = _make_result(info, "bilibili", url)
+    result["_play_url"] = play_url
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1931,6 +1990,8 @@ def extract_keyframes(url, platform, config, play_url=None, duration=None):
             video_path = _download_douyin_audio(play_url, tmp_dir)
         elif play_url and platform == "xiaohongshu":
             video_path = _download_xhs_video(play_url, tmp_dir)
+        elif play_url and platform == "bilibili":
+            video_path = _download_bili_media(play_url, tmp_dir)
 
         if not video_path and _check_ytdlp():
             log("Downloading video for frame extraction...")
@@ -1996,15 +2057,17 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
         log("Downloading audio for Whisper transcription...")
         audio_path = None
 
-        if _check_ytdlp():
-            audio_path = _ytdlp_download_audio(url, tmp_dir, platform)
-
-        if not audio_path and play_url:
+        if play_url:
             log("Trying direct download via play_url...")
             if platform == "xiaohongshu":
                 audio_path = _download_xhs_video(play_url, tmp_dir)
+            elif platform == "bilibili":
+                audio_path = _download_bili_media(play_url, tmp_dir)
             else:
                 audio_path = _download_douyin_audio(play_url, tmp_dir)
+
+        if not audio_path and _check_ytdlp():
+            audio_path = _ytdlp_download_audio(url, tmp_dir, platform)
 
         if not audio_path:
             if not _check_ytdlp():
@@ -2135,15 +2198,19 @@ def _whisper_local(audio_path, config):
 
     model_size = config.get("whisper_model", "base")
     language = config.get("language", "zh")
-    log(f"Loading Whisper model '{model_size}'...")
 
-    try:
-        model = WhisperModel(model_size, device="auto", compute_type="auto")
-        segments, _ = model.transcribe(audio_path, language=language)
-        return _cues_from_segments(segments)
-    except Exception as e:
-        log(f"Local Whisper transcription failed: {e}", "ERROR")
-        return None, []
+    last_error = None
+    for device, compute_type in (("auto", "auto"), ("cpu", "int8")):
+        try:
+            log(f"Loading Whisper model '{model_size}' on {device}/{compute_type}...")
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            segments, _ = model.transcribe(audio_path, language=language)
+            return _cues_from_segments(segments)
+        except Exception as e:
+            last_error = e
+            log(f"Whisper {device}/{compute_type} failed: {e}", "WARN")
+    log(f"Local Whisper transcription failed: {last_error}", "ERROR")
+    return None, []
 
 
 # ---------------------------------------------------------------------------
