@@ -15,7 +15,7 @@ Extract video transcripts or image-text posts, then write structured notes. No l
 |---|---|---|
 | Bilibili (B站) | `bilibili.com/video/`, `b23.tv/`, `BV*` | Public API (WBI signing) |
 | YouTube | `youtube.com/watch`, `youtu.be/`, `youtube.com/shorts/` | `youtube-transcript-api` |
-| Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | `yt-dlp` |
+| Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | Share page / public SEO snapshot (notes) or `yt-dlp` (video) |
 | Xiaohongshu (小红书) | `xiaohongshu.com/`, `xhslink.com/` | Page parse (video or post) |
 | Weixin (公众号) | `mp.weixin.qq.com/` | Public free article HTML |
 | TikTok | `tiktok.com/` | `yt-dlp` |
@@ -77,7 +77,7 @@ Replace `<skill_path>` with the absolute path to this skill's directory, and `<U
 The script automatically:
 1. Detects the platform and page type from the URL / page data
 2. For video: tries platform subtitle APIs, then yt-dlp subs, then Whisper
-3. For post: extracts title, body, and local image paths (when implemented)
+3. For post: extracts title, body, and local image paths (max 20, all-or-nothing)
 
 The script outputs a JSON object to stdout containing:
 - `content_type` - `video` or `post`. Use this to pick the template below
