@@ -1,5 +1,5 @@
 {
-    "_comment": "Video Summarizer configuration. whisper_mode: 'disabled' | 'local' | 'api'. extract_frames: true to capture keyframes. cache_ttl_days: 0 = forever.",
+    "_comment": "Social Summarizer configuration. whisper_mode: 'disabled' | 'local' | 'api' (videos). extract_frames: video keyframes. cache_ttl_days applies to cache/, screenshots/, and images/. 0 = forever.",
     "whisper_mode": "local",
     "openai_api_key": "",
     "whisper_model": "base",

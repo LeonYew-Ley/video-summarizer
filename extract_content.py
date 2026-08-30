@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Multi-Platform Video Subtitle Extractor
-Extracts subtitles/transcripts from multiple video platforms for AI summarization.
+Social Summarizer content extractor.
+Extracts video transcripts or image-text posts for AI summarization.
 
 Supported platforms:
   - Bilibili (public API with WBI signing)
   - YouTube (youtube-transcript-api or yt-dlp)
   - Douyin / TikTok (yt-dlp)
-  - Xiaohongshu (yt-dlp)
+  - Xiaohongshu (page parse / yt-dlp)
   - Any yt-dlp supported site (1800+ sites)
 
-Fallback chain:
+Video fallback chain:
   1. Platform-specific subtitle API (free, no auth)
   2. yt-dlp subtitle extraction
   3. yt-dlp audio download + Whisper ASR (local or API)
@@ -19,6 +19,7 @@ Fallback chain:
 import glob
 import gzip
 import hashlib
+import html as html_lib
 import io
 import json
 import os
@@ -28,10 +29,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from functools import reduce
+from html.parser import HTMLParser
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
@@ -41,6 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 SCREENSHOTS_DIR = os.path.join(SCRIPT_DIR, "screenshots")
+IMAGES_DIR = os.path.join(SCRIPT_DIR, "images")
 COOKIES_PATHS = [
     os.path.join(SCRIPT_DIR, "cookies.txt"),
     os.path.join(SCRIPT_DIR, "www.douyin.com_cookies.txt"),
@@ -73,6 +77,24 @@ def _cache_key(url):
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
+def _normalize_input_url(raw):
+    """Pull the first http(s) URL out of share text / 口令."""
+    if not raw:
+        return raw
+    match = re.search(r"https?://[^\s<>\"'，]+", raw)
+    if match:
+        return match.group(0).rstrip(".,;)]）")
+    return raw.strip()
+
+
+def _cacheable(result):
+    if not result or result.get("error"):
+        return False
+    if result.get("subtitle_text"):
+        return True
+    return result.get("content_type") == "post" and bool(result.get("images"))
+
+
 def _read_cache(url):
     key = _cache_key(url)
     path = os.path.join(CACHE_DIR, f"{key}.json")
@@ -86,7 +108,7 @@ def _read_cache(url):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("subtitle_text"):
+            if _cacheable(data):
                 log(f"Cache hit: {key}")
                 data["_cached"] = True
                 return data
@@ -97,7 +119,7 @@ def _read_cache(url):
 
 def _write_cache(url, result):
     """Cache a successful extraction result."""
-    if not result or not result.get("subtitle_text"):
+    if not _cacheable(result):
         return
     os.makedirs(CACHE_DIR, exist_ok=True)
     key = _cache_key(url)
@@ -137,6 +159,9 @@ PLATFORM_PATTERNS = [
     ]),
     ("tiktok", [
         r"tiktok\.com/",
+    ]),
+    ("weixin", [
+        r"mp\.weixin\.qq\.com/",
     ]),
 ]
 
@@ -202,10 +227,13 @@ BILI_HEADERS = {
     **DEFAULT_HEADERS,
     "Referer": "https://www.bilibili.com",
     "Origin": "https://www.bilibili.com",
+    # Guest device id only — not a login cookie. Avoids some 412s on page fetch.
+    "Cookie": f"buvid3={str(uuid.uuid4()).upper()}infoc; b_nut={int(time.time())}",
 }
 
 API_VIDEO_VIEW = "https://api.bilibili.com/x/web-interface/view"
 API_PLAYER_V2 = "https://api.bilibili.com/x/player/wbi/v2"
+API_PLAYURL = "https://api.bilibili.com/x/player/playurl"
 API_NAV = "https://api.bilibili.com/x/web-interface/nav"
 API_CONCLUSION = "https://api.bilibili.com/x/web-interface/view/conclusion/get"
 
@@ -261,6 +289,64 @@ def _extract_bvid(url_or_bvid):
     return None
 
 
+def _make_cue(start, end, text):
+    """Build a timed cue dict. start/end are seconds. Returns None if unusable."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        start = float(start)
+        end = float(end) if end is not None else start
+    except (TypeError, ValueError):
+        return None
+    if end < start:
+        end = start
+    return {"start": round(start, 3), "end": round(end, 3), "text": text}
+
+
+def _timestamp_to_seconds(value):
+    """Parse VTT/SRT timestamps like 00:01:02.500 or 01:02,500 into seconds."""
+    if value is None:
+        return None
+    value = str(value).strip().replace(",", ".")
+    value = re.split(r"\s+", value, maxsplit=1)[0]
+    parts = value.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 1:
+            return float(parts[0])
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _cues_from_segments(segments, time_offset=0.0):
+    """Normalize Whisper/API segment objects into (text, cues)."""
+    lines = []
+    cues = []
+    for seg in segments or []:
+        if isinstance(seg, dict):
+            text = (seg.get("text") or "").strip()
+            start = seg.get("start", 0)
+            end = seg.get("end", start)
+        else:
+            text = (getattr(seg, "text", "") or "").strip()
+            start = getattr(seg, "start", 0)
+            end = getattr(seg, "end", start)
+        if not text:
+            continue
+        lines.append(text)
+        cue = _make_cue(float(start) + time_offset, float(end) + time_offset, text)
+        if cue:
+            cues.append(cue)
+    if not lines:
+        return None, []
+    return "\n".join(lines), cues
+
+
 def _bili_parse_subtitle_list(subtitles):
     urls = []
     for sub in subtitles:
@@ -277,17 +363,79 @@ def _bili_parse_subtitle_list(subtitles):
 
 
 def _bili_download_subtitle(url):
+    """Return (text, cues) from a Bilibili subtitle JSON URL."""
     try:
         text = http_get(url, headers=BILI_HEADERS)
         data = json.loads(text)
         body = data.get("body", [])
         if not body:
-            return None
-        lines = [item.get("content", "").strip() for item in body]
-        return "\n".join(line for line in lines if line)
+            return None, []
+        lines = []
+        cues = []
+        for item in body:
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            lines.append(content)
+            cue = _make_cue(item.get("from"), item.get("to"), content)
+            if cue:
+                cues.append(cue)
+        if not lines:
+            return None, []
+        return "\n".join(lines), cues
     except Exception as e:
         log(f"Failed to download subtitle: {e}", "ERROR")
+        return None, []
+
+
+def _bili_play_url(bvid, cid):
+    """Guest playurl (low-q mp4). Used for Whisper when yt-dlp hits 412."""
+    if not bvid or not cid:
         return None
+    params = {
+        "bvid": bvid, "cid": cid, "qn": 16, "fnval": 1, "fnver": 0, "fourk": 0,
+    }
+    img_key, sub_key = _get_wbi_keys()
+    if img_key and sub_key:
+        params = _sign_wbi(params, img_key, sub_key)
+    resp = api_request(API_PLAYURL, params=params, headers=BILI_HEADERS)
+    if not resp or resp.get("code") != 0:
+        return None
+    data = resp.get("data") or {}
+    for item in data.get("durl") or []:
+        url = item.get("url") or item.get("backup_url")
+        if isinstance(url, list):
+            url = url[0] if url else None
+        if url:
+            return url
+    dash = data.get("dash") or {}
+    for stream in (dash.get("audio") or []) + (dash.get("video") or []):
+        url = stream.get("baseUrl") or stream.get("base_url")
+        if url:
+            return url
+    return None
+
+
+def _download_bili_media(play_url, tmp_dir):
+    """Download Bilibili CDN media with guest Referer. Returns path or None."""
+    if not play_url:
+        return None
+    try:
+        dest = os.path.join(tmp_dir, "bili_media.mp4")
+        req = urllib.request.Request(play_url, headers=BILI_HEADERS)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if os.path.exists(dest) and os.path.getsize(dest) > 1000:
+            log(f"Downloaded Bilibili media: {os.path.getsize(dest) // 1024}KB")
+            return dest
+    except Exception as e:
+        log(f"Bilibili direct download failed: {e}", "WARN")
+    return None
 
 
 def _bili_pick_and_download(subtitle_urls):
@@ -295,14 +443,14 @@ def _bili_pick_and_download(subtitle_urls):
     for lang in preferred_langs:
         for sub in subtitle_urls:
             if lang in sub["lang"]:
-                text = _bili_download_subtitle(sub["url"])
+                text, cues = _bili_download_subtitle(sub["url"])
                 if text:
-                    return text, sub["lang_doc"]
+                    return text, cues, sub["lang_doc"]
     for sub in subtitle_urls:
-        text = _bili_download_subtitle(sub["url"])
+        text, cues = _bili_download_subtitle(sub["url"])
         if text:
-            return text, sub["lang_doc"]
-    return None, None
+            return text, cues, sub["lang_doc"]
+    return None, [], None
 
 
 def extract_bilibili(url):
@@ -397,11 +545,15 @@ def extract_bilibili(url):
                         if subtitle_urls:
                             break
 
+    play_url = _bili_play_url(bvid, cid)
+
     # Download best subtitle
     if subtitle_urls:
-        text, lang = _bili_pick_and_download(subtitle_urls)
+        text, cues, lang = _bili_pick_and_download(subtitle_urls)
         if text:
-            return _make_result(info, "bilibili", url, text, "subtitle")
+            result = _make_result(info, "bilibili", url, text, "subtitle", cues=cues)
+            result["_play_url"] = play_url
+            return result
 
     # Method 5: B站 AI conclusion API
     if aid and cid and mid:
@@ -427,9 +579,13 @@ def extract_bilibili(url):
                         if content:
                             parts.append(f"- {content}")
                 if parts:
-                    return _make_result(info, "bilibili", url, "\n".join(parts), "ai_conclusion")
+                    result = _make_result(info, "bilibili", url, "\n".join(parts), "ai_conclusion")
+                    result["_play_url"] = play_url
+                    return result
 
-    return _make_result(info, "bilibili", url)
+    result = _make_result(info, "bilibili", url)
+    result["_play_url"] = play_url
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -483,17 +639,31 @@ def extract_youtube(url):
             if transcript:
                 fetched = transcript.fetch()
                 lines = []
+                cues = []
                 for entry in fetched:
                     if isinstance(entry, dict):
-                        lines.append(entry.get("text", "").strip())
+                        text_line = (entry.get("text") or "").strip()
+                        start = entry.get("start", 0)
+                        duration = entry.get("duration", 0) or 0
                     elif hasattr(entry, "text"):
-                        lines.append(entry.text.strip())
+                        text_line = (entry.text or "").strip()
+                        start = getattr(entry, "start", 0)
+                        duration = getattr(entry, "duration", 0) or 0
                     else:
-                        lines.append(str(entry).strip())
-                text = "\n".join(line for line in lines if line)
+                        text_line = str(entry).strip()
+                        start = None
+                        duration = 0
+                    if not text_line:
+                        continue
+                    lines.append(text_line)
+                    if start is not None:
+                        cue = _make_cue(start, float(start) + float(duration), text_line)
+                        if cue:
+                            cues.append(cue)
+                text = "\n".join(lines)
                 if text:
                     _fill_youtube_info(info, video_id)
-                    return _make_result(info, "youtube", canonical_url, text, "transcript_api")
+                    return _make_result(info, "youtube", canonical_url, text, "transcript_api", cues=cues)
         except Exception as e:
             log(f"youtube-transcript-api failed: {e}", "WARN")
     except ImportError:
@@ -528,6 +698,17 @@ DOUYIN_MOBILE_UA = (
     "com.ss.android.ugc.aweme/110101 "
     "(Linux; U; Android 12; en_US; Pixel 6; Build/SD1A.210817.036; "
     "Cronet/TTNetVersion:b4d74d15 2023-04-08)"
+)
+
+# Public SEO snapshot of the share page (item_list is no longer in app SSR).
+DOUYIN_SEO_UA = (
+    "Mozilla/5.0 (compatible; Baiduspider/2.0; "
+    "+http://www.baidu.com/search/spider.html)"
+)
+DOUYIN_SEO_IMAGE_RE = re.compile(
+    r"https://p\d+-pc-sign\.douyinpic\.com/"
+    r"(tos-cn-i-[^/\"'\s~]+/[^/\"'\s~]+)~tplv-dy-aweme-images[^\"'\s]*",
+    re.I,
 )
 
 AUTO_COOKIES_PATH = os.path.join(SCRIPT_DIR, "_auto_douyin_cookies.txt")
@@ -615,82 +796,291 @@ def _fetch_fresh_douyin_cookies():
         return None
 
 
+def _match_douyin_id(url):
+    patterns = [
+        (r"douyin\.com/note/(\d+)", "note"),
+        (r"douyin\.com/video/(\d+)", "video"),
+        (r"iesdouyin\.com/share/note/(\d+)", "note"),
+        (r"iesdouyin\.com/share/video/(\d+)", "video"),
+    ]
+    for pat, kind in patterns:
+        match = re.search(pat, url or "")
+        if match:
+            return match.group(1), kind
+    return None, None
+
+
 def _resolve_douyin_url(url):
-    """Resolve v.douyin.com short link to full URL, extract video ID."""
+    """Resolve v.douyin.com short link. Returns (aweme_id, resolved_url, kind)."""
+    url = _normalize_input_url(url)
+    resolved = url
     try:
         req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
         with urllib.request.urlopen(req, timeout=10) as resp:
             resolved = resp.url
-        match = re.search(r'douyin\.com/video/(\d+)', resolved)
-        if match:
-            return match.group(1), resolved
     except Exception as e:
         log(f"Failed to resolve Douyin URL: {e}", "WARN")
-    match = re.search(r'douyin\.com/video/(\d+)', url)
-    if match:
-        return match.group(1), url
-    return None, url
+    aweme_id, kind = _match_douyin_id(resolved)
+    if not aweme_id:
+        aweme_id, kind = _match_douyin_id(url)
+    return aweme_id, resolved, kind
 
 
-def _douyin_share_api(video_id):
-    """Fetch video metadata from iesdouyin.com share page (mobile UA, no login).
-    Returns (info_dict, play_url) or (None, None)."""
-    share_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
+def _loads_embedded_json(raw):
+    raw = (raw or "").strip()
+    if raw.endswith(";"):
+        raw = raw[:-1]
     try:
-        req = urllib.request.Request(share_url, headers={
-            "User-Agent": DOUYIN_MOBILE_UA,
-            "Accept": "*/*",
-        })
-        resp = urllib.request.urlopen(req, timeout=15)
-        html = resp.read().decode("utf-8", errors="replace")
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    cleaned = re.sub(r"\bundefined\b", "null", raw)
+    cleaned = re.sub(r"\bNaN\b", "null", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
 
-        m = re.search(r"_ROUTER_DATA\s*=\s*", html)
-        if not m:
-            return None, None
-        json_start = m.end()
-        script_end = html.find("</script>", json_start)
-        if script_end == -1:
-            return None, None
-        raw_json = html[json_start:script_end].strip()
 
-        router_data = json.loads(raw_json)
-        loader = router_data.get("loaderData", {})
-        item = None
-        for v in loader.values():
-            if not isinstance(v, dict):
-                continue
-            video_res = v.get("videoInfoRes") or v
-            items = video_res.get("item_list", [])
-            if items:
-                item = items[0]
+def _parse_script_assignment(html, marker):
+    match = re.search(re.escape(marker) + r"\s*=\s*", html or "")
+    if not match:
+        return None
+    json_start = match.end()
+    script_end = html.find("</script>", json_start)
+    if script_end == -1:
+        return None
+    return _loads_embedded_json(html[json_start:script_end])
+
+
+def _find_item_list(obj):
+    """Walk nested JSON for a Douyin item_list with aweme/video/images."""
+    if isinstance(obj, dict):
+        items = obj.get("item_list")
+        if isinstance(items, list) and items:
+            first = items[0]
+            if isinstance(first, dict) and (
+                "aweme_id" in first or "video" in first or "images" in first
+                or "image_post_info" in first
+            ):
+                return first
+        for value in obj.values():
+            found = _find_item_list(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_item_list(value)
+            if found:
+                return found
+    return None
+
+
+def _douyin_item_from_share_html(html):
+    router_data = _parse_script_assignment(html, "_ROUTER_DATA")
+    if router_data:
+        item = _find_item_list(router_data)
+        if item:
+            return item
+    render_data = _parse_script_assignment(html, "window._RENDER_DATA")
+    if render_data:
+        item = _find_item_list(render_data)
+        if item:
+            return item
+    match = re.search(
+        r'<script[^>]+id="RENDER_DATA"[^>]*>(.*?)</script>',
+        html or "",
+        re.I | re.DOTALL,
+    )
+    if match:
+        raw = urllib.parse.unquote(match.group(1).strip())
+        decoded = _loads_embedded_json(raw)
+        if decoded:
+            return _find_item_list(decoded)
+    return None
+
+
+def _douyin_payload_from_seo_html(html):
+    """Parse title, author, and aweme_images from the public SEO share page."""
+    if not html:
+        return None
+    title = _weixin_meta(html, r"<title[^>]*>(.*?)</title>")
+    title = re.sub(r"\s+", " ", title).replace(" - 抖音", "").strip()
+    description = _weixin_meta(html, r'name="description"\s+content="([^"]*)"')
+    description = html_lib.unescape(description).strip()
+    author = ""
+    author_match = re.search(r" - ([^于\n]{1,40})于\d{8}发布", description)
+    if author_match:
+        author = author_match.group(1).strip()
+        description = description[: author_match.start()].strip()
+    seen = {}
+    for match in DOUYIN_SEO_IMAGE_RE.finditer(html.replace("&amp;", "&")):
+        key = match.group(1)
+        if key not in seen:
+            seen[key] = match.group(0)
+    image_urls = list(seen.values())
+    if not title and not image_urls:
+        return None
+    return {
+        "info": {
+            "title": title,
+            "author": author,
+            "duration": 0,
+            "description": description or title,
+        },
+        "play_url": None,
+        "image_urls": image_urls,
+        "aweme_type": 68 if image_urls else None,
+        "item": None,
+    }
+
+
+def _douyin_item_payload(item):
+    info = {
+        "title": item.get("desc", "") or "",
+        "author": (item.get("author") or {}).get("nickname", ""),
+        "duration": (item.get("video") or {}).get("duration", 0) or 0,
+        "description": item.get("desc", "") or "",
+    }
+    dur = info["duration"]
+    if isinstance(dur, (int, float)) and dur > 10000:
+        info["duration"] = dur / 1000.0
+
+    play_url = None
+    video_obj = item.get("video") or {}
+    play_uri = None
+    for addr_key in ("play_addr", "play_addr_h264", "download_addr"):
+        addr = video_obj.get(addr_key) or {}
+        if isinstance(addr, dict):
+            if not play_uri:
+                play_uri = addr.get("uri")
+            urls = addr.get("url_list") or []
+            if urls:
+                play_url = urls[0]
                 break
-        if not item:
-            return None, None
+    if not play_url and play_uri:
+        play_url = (
+            f"https://www.iesdouyin.com/aweme/v1/play/"
+            f"?video_id={play_uri}&ratio=720p&line=0"
+        )
 
-        info = {
-            "title": item.get("desc", ""),
-            "author": (item.get("author") or {}).get("nickname", ""),
-            "duration": (item.get("video") or {}).get("duration", 0),
-            "description": item.get("desc", ""),
-        }
-        dur = info["duration"]
-        if isinstance(dur, (int, float)) and dur > 10000:
-            info["duration"] = dur / 1000.0
+    image_urls = []
+    seen = set()
 
-        play_url = None
-        video_obj = item.get("video", {})
-        for addr_key in ("play_addr", "play_addr_h264", "download_addr"):
-            addr = video_obj.get(addr_key, {})
-            if isinstance(addr, dict):
-                urls = addr.get("url_list", [])
-                if urls:
-                    play_url = urls[0]
-                    break
+    def _add_image_url(url):
+        if url and url not in seen:
+            seen.add(url)
+            image_urls.append(url)
 
-        return info, play_url
+    for img in item.get("images") or []:
+        if not isinstance(img, dict):
+            continue
+        url_list = img.get("url_list") or img.get("download_url_list") or []
+        if url_list:
+            _add_image_url(url_list[-1])
+    post = item.get("image_post_info") or {}
+    if isinstance(post, dict):
+        for img in post.get("images") or []:
+            if isinstance(img, dict):
+                url_list = img.get("url_list") or img.get("download_url_list") or []
+                if url_list:
+                    _add_image_url(url_list[-1])
+
+    return {
+        "info": info,
+        "play_url": play_url,
+        "image_urls": image_urls,
+        "aweme_type": item.get("aweme_type"),
+        "item": item,
+    }
+
+
+def _douyin_is_post(payload, kind):
+    if not payload:
+        return False
+    if kind == "note":
+        return True
+    if payload.get("image_urls"):
+        return True
+    return payload.get("aweme_type") in (2, 68, "2", "68")
+
+
+def _douyin_share_api(aweme_id, kind=None):
+    """Fetch metadata from iesdouyin.com share page. Returns payload dict or None."""
+    if kind == "note":
+        share_urls = [
+            f"https://www.iesdouyin.com/share/note/{aweme_id}/",
+            f"https://www.iesdouyin.com/share/video/{aweme_id}/",
+        ]
+    elif kind == "video":
+        share_urls = [f"https://www.iesdouyin.com/share/video/{aweme_id}/"]
+    else:
+        share_urls = [
+            f"https://www.iesdouyin.com/share/video/{aweme_id}/",
+            f"https://www.iesdouyin.com/share/note/{aweme_id}/",
+        ]
+
+    user_agents = (
+        DOUYIN_MOBILE_UA,
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1",
+    )
+    if kind != "video":
+        user_agents = user_agents + (DOUYIN_SEO_UA,)
+    for share_url in share_urls:
+        for ua in user_agents:
+            try:
+                req = urllib.request.Request(share_url, headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,*/*",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                })
+                resp = urllib.request.urlopen(req, timeout=15)
+                html = resp.read().decode("utf-8", errors="replace")
+                item = _douyin_item_from_share_html(html)
+                if item:
+                    return _douyin_item_payload(item)
+                if ua == DOUYIN_SEO_UA:
+                    seo = _douyin_payload_from_seo_html(html)
+                    if seo and seo.get("image_urls"):
+                        return seo
+            except Exception as e:
+                log(f"Douyin share API failed ({share_url}): {e}", "WARN")
+    return None
+
+
+def _douyin_payload_from_web_detail(aweme_id):
+    """Public web detail JSON via SEO UA. Share SSR no longer embeds item_list."""
+    if not aweme_id:
+        return None
+    params = {
+        "aweme_id": aweme_id,
+        "aid": "1128",
+        "version_name": "23.5.0",
+        "device_platform": "android",
+        "os_version": "2333",
+    }
+    url = "https://www.douyin.com/aweme/v1/web/aweme/detail/?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": DOUYIN_SEO_UA,
+            "Accept": "application/json,*/*",
+            "Referer": "https://www.douyin.com/",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        log(f"Douyin share API failed: {e}", "WARN")
-    return None, None
+        log(f"Douyin web detail failed: {e}", "WARN")
+        return None
+    detail = data.get("aweme_detail")
+    if not isinstance(detail, dict):
+        return None
+    payload = _douyin_item_payload(detail)
+    if payload.get("play_url") or (payload.get("info") or {}).get("title"):
+        log("Douyin video metadata from public web detail")
+        return payload
+    return None
 
 
 def _download_douyin_audio(play_url, tmp_dir):
@@ -730,17 +1120,57 @@ XHS_MOBILE_UA = (
     "Mobile/15E148 Safari/604.1"
 )
 
+XHS_DESKTOP_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+    "upgrade-insecure-requests": "1",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _follow_location(url, headers, max_hops=5):
+    """Read Location like nfe-w (maxRedirects: 0) instead of auto-following."""
+    current = url
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(max_hops):
+        req = urllib.request.Request(current, headers=headers)
+        try:
+            with opener.open(req, timeout=15) as resp:
+                return resp.url, resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            location = e.headers.get("Location")
+            if e.code in (301, 302, 303, 307, 308) and location:
+                current = urllib.parse.urljoin(current, location)
+                continue
+            raise
+    return current, None
+
 
 def _resolve_xhs_url(url):
     """Resolve xhslink.com short link and extract note ID."""
+    url = _normalize_input_url(url)
+    html = None
+    resolved = url
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": XHS_MOBILE_UA,
-            "Accept": "text/html,*/*",
-        })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resolved = resp.url
-            html = resp.read().decode("utf-8", errors="replace")
+        if re.search(r"xhslink\.com", url):
+            resolved, html = _follow_location(url, XHS_DESKTOP_HEADERS)
+        if html is None:
+            req = urllib.request.Request(url if resolved == url else resolved, headers=XHS_DESKTOP_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resolved = resp.url
+                html = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         log(f"Failed to resolve XHS URL: {e}", "WARN")
         return None, None, url
@@ -748,6 +1178,7 @@ def _resolve_xhs_url(url):
     for pat in [
         r"/discovery/item/([a-f0-9]+)",
         r"/explore/([a-f0-9]+)",
+        r"/item/([a-f0-9]+)",
         r"noteId[\"=:]\"?([a-f0-9]{24})",
     ]:
         m = re.search(pat, resolved)
@@ -757,74 +1188,153 @@ def _resolve_xhs_url(url):
     return None, html, resolved
 
 
+def _xhs_note_from_setup(html):
+    data = _parse_script_assignment(html, "window.__SETUP_SERVER_STATE__")
+    if not data:
+        return None
+    return (data.get("LAUNCHER_SSR_STORE_PAGE_DATA") or {}).get("noteData") or None
+
+
+def _xhs_note_from_initial(html):
+    data = _parse_script_assignment(html, "window.__INITIAL_STATE__")
+    if not data:
+        return None
+    note = data.get("note") or {}
+    first_id = note.get("firstNoteId")
+    detail_map = note.get("noteDetailMap") or {}
+    if first_id and isinstance(detail_map.get(first_id), dict):
+        return detail_map[first_id].get("note")
+    for value in detail_map.values():
+        if isinstance(value, dict) and value.get("note"):
+            return value["note"]
+    return None
+
+
 def _parse_xhs_page(html):
     """Parse XHS page HTML for note data and video URLs from __SETUP_SERVER_STATE__."""
-    m = re.search(r"window\.__SETUP_SERVER_STATE__\s*=\s*", html)
-    if not m:
+    note = _xhs_note_from_html(html)
+    if not note:
         return None, None
+    return _xhs_info_from_note(note), _xhs_video_play_url(note)
 
-    json_start = m.end()
-    script_end = html.find("</script>", json_start)
-    if script_end == -1:
-        return None, None
 
-    raw = html[json_start:script_end].strip()
-    if raw.endswith(";"):
-        raw = raw[:-1]
+def _xhs_note_from_html(html):
+    note = _xhs_note_from_setup(html)
+    if note and (note.get("imageList") or _xhs_video_play_url(note) or note.get("title") or note.get("desc")):
+        return note
+    return _xhs_note_from_initial(html) or note
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None, None
 
-    note_data = data.get("LAUNCHER_SSR_STORE_PAGE_DATA", {}).get("noteData", {})
-    if not note_data:
-        return None, None
-
-    user = note_data.get("user", {})
-    video_obj = note_data.get("video", {})
-    media = video_obj.get("media", {})
-    capa = video_obj.get("capa", {})
-    vid = media.get("video", {})
-
-    duration = capa.get("duration") or vid.get("duration", 0)
+def _xhs_info_from_note(note):
+    user = note.get("user") or {}
+    video_obj = note.get("video") or {}
+    media = video_obj.get("media") or {}
+    capa = video_obj.get("capa") or {}
+    vid = media.get("video") or {}
+    duration = capa.get("duration") or vid.get("duration", 0) or 0
     if isinstance(duration, (int, float)) and duration > 10000:
         duration = duration / 1000.0
-
-    info = {
-        "title": note_data.get("title", ""),
-        "author": user.get("nickName", ""),
+    author = user.get("nickName") or user.get("nickname") or ""
+    return {
+        "title": note.get("title", "") or "",
+        "author": author,
         "duration": duration,
-        "description": note_data.get("desc", ""),
+        "description": note.get("desc", "") or "",
     }
 
-    play_url = None
-    stream = media.get("stream", {})
+
+def _xhs_video_play_url(note):
+    if not note:
+        return None
+    video_obj = note.get("video") or {}
+    media = video_obj.get("media") or {}
+    stream = media.get("stream") or {}
     for codec in ("h264", "h265", "av1", "h266"):
-        streams = stream.get(codec, [])
+        streams = stream.get(codec) or []
         if streams and isinstance(streams, list):
-            best = streams[0]
+            best = streams[0] or {}
             play_url = best.get("masterUrl")
             if play_url:
-                break
-            backup = best.get("backupUrls", [])
+                return play_url
+            backup = best.get("backupUrls") or []
             if backup:
-                play_url = backup[0]
-                break
+                return backup[0]
+    return None
 
-    return info, play_url
+
+def _xhs_is_video_note(note):
+    ntype = (note.get("type") or "").lower()
+    if ntype == "video":
+        return True
+    return bool(_xhs_video_play_url(note))
+
+
+def _xhs_image_urls(note):
+    """Rewrite imageList to ci.xiaohongshu.com URLs. None means a listed image is unusable."""
+    image_list = note.get("imageList") or []
+    urls = []
+    for item in image_list:
+        if not isinstance(item, dict):
+            return None
+        info_list = item.get("infoList") or []
+        info_url = ""
+        if info_list and isinstance(info_list[0], dict):
+            info_url = info_list[0].get("url") or ""
+        token_match = XHS_PIC_TOKEN_RE.search(info_url)
+        chosen = None
+        if token_match:
+            chosen = f"https://ci.xiaohongshu.com/{token_match.group(1)}?imageView2/2/w/0/format/png"
+        if not chosen:
+            chosen = item.get("urlDefault") or item.get("urlPre") or info_url
+        if not chosen:
+            return None
+        urls.append(chosen)
+    return urls
 
 
 def extract_xiaohongshu(url):
-    """Extract Xiaohongshu video info via mobile page HTML (no cookies needed)."""
+    """Extract Xiaohongshu video or image note via mobile page HTML."""
     note_id, html, resolved_url = _resolve_xhs_url(url)
 
+    blocked = (
+        html
+        and (
+            "/404" in resolved_url
+            or "error_code=300031" in html
+            or "undertake_note_error" in resolved_url
+            or "该内容暂时无法查看" in urllib.parse.unquote(resolved_url)
+        )
+    )
+    if blocked:
+        return _make_post_result(
+            {"title": "", "author": "", "duration": 0, "description": ""},
+            "xiaohongshu",
+            resolved_url,
+            error="Xiaohongshu note is unavailable or blocked",
+        )
+
     if html:
-        info, play_url = _parse_xhs_page(html)
-        if info:
-            log(f"XHS note: {info['title']} (duration={info['duration']}s)")
+        note = _xhs_note_from_html(html)
+        if note:
+            info = _xhs_info_from_note(note)
+            log(f"XHS note: {info['title'] or info['description'][:40]} (type={note.get('type')})")
+            if not _xhs_is_video_note(note):
+                image_urls = _xhs_image_urls(note)
+                if image_urls is None:
+                    return _make_post_result(
+                        info, "xiaohongshu", resolved_url,
+                        error="Failed to resolve Xiaohongshu image URLs",
+                    )
+                return _finalize_post(
+                    info,
+                    "xiaohongshu",
+                    resolved_url,
+                    image_urls,
+                    referer="https://www.xiaohongshu.com/",
+                    user_agent=XHS_MOBILE_UA,
+                )
             result = _make_result(info, "xiaohongshu", resolved_url)
-            result["_play_url"] = play_url
+            result["_play_url"] = _xhs_video_play_url(note)
             return result
 
     return _make_result(
@@ -859,19 +1369,206 @@ def _download_xhs_video(play_url, tmp_dir):
 
 
 def extract_douyin(url):
-    """Extract Douyin video info via the iesdouyin share page (no cookies needed).
-    Returns result dict with info (and optionally subtitle_text if found)."""
-    video_id, resolved_url = _resolve_douyin_url(url)
-    if not video_id:
+    """Extract Douyin video or image-note via the iesdouyin share page."""
+    aweme_id, resolved_url, kind = _resolve_douyin_url(url)
+    if not aweme_id:
         return None
 
-    info, play_url = _douyin_share_api(video_id)
-    if not info:
+    payload = _douyin_share_api(aweme_id, kind=kind)
+    if kind == "note":
+        info = (payload or {}).get("info") or {
+            "title": "", "author": "", "duration": 0, "description": "",
+        }
+        if not payload:
+            return _make_post_result(
+                info, "douyin", resolved_url,
+                error="Could not parse Douyin note page (share page had no embedded item data)",
+            )
+        return _finalize_post(
+            info,
+            "douyin",
+            resolved_url,
+            payload.get("image_urls") or [],
+            referer="https://www.douyin.com/",
+            user_agent=DOUYIN_MOBILE_UA,
+        )
+
+    if kind == "video" and (not payload or not payload.get("play_url")):
+        detail = _douyin_payload_from_web_detail(aweme_id)
+        if detail:
+            payload = detail
+
+    if not payload:
         info = {"title": "", "author": "", "duration": 0, "description": ""}
+        result = _make_result(info, "douyin", resolved_url)
+        return result
+
+    info = payload["info"]
+    if _douyin_is_post(payload, kind):
+        return _finalize_post(
+            info,
+            "douyin",
+            resolved_url,
+            payload.get("image_urls") or [],
+            referer="https://www.douyin.com/",
+            user_agent=DOUYIN_MOBILE_UA,
+        )
 
     result = _make_result(info, "douyin", resolved_url)
-    result["_play_url"] = play_url
+    result["_play_url"] = payload.get("play_url")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Weixin public article extractor
+# ---------------------------------------------------------------------------
+
+WEIXIN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://mp.weixin.qq.com/",
+}
+
+WEIXIN_PAYWALL_MARKERS = (
+    "is_pay_subscribe: '1'",
+    'is_pay_subscribe: "1"',
+)
+WEIXIN_VERIFY_MARKERS = (
+    'id="js_verify"',
+    'id="verify_code"',
+    "此内容需关注",
+    "关注后才能阅读",
+    "关注后可查看",
+    "关注公众号后阅读",
+    "环境异常",
+    "完成验证后即可继续访问",
+)
+# Body copy about the product feature is not a paywall. Only treat
+# 「付费阅读」as blocked when the article is not explicitly free.
+WEIXIN_PAYWALL_PHRASE = "付费阅读"
+
+
+class _WeixinContentParser(HTMLParser):
+    """Collect visible text and image URLs from #js_content."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_content = False
+        self.depth = 0
+        self.parts = []
+        self.images = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if not self.in_content:
+            if attrs.get("id") == "js_content":
+                self.in_content = True
+                self.depth = 1
+            return
+        if tag == "div":
+            self.depth += 1
+        if tag in ("p", "br", "h1", "h2", "h3", "h4", "li", "section"):
+            self.parts.append("\n")
+        if tag == "img":
+            src = attrs.get("data-src") or attrs.get("data-original") or attrs.get("src")
+            if src and src.startswith("http"):
+                self.images.append(src)
+
+    def handle_endtag(self, tag):
+        if self.in_content and tag == "div":
+            self.depth -= 1
+            if self.depth <= 0:
+                self.in_content = False
+
+    def handle_data(self, data):
+        if self.in_content:
+            text = data.strip()
+            if text:
+                self.parts.append(text)
+
+
+def _weixin_blocked_reason(html):
+    if not html:
+        return "empty page"
+    for marker in WEIXIN_PAYWALL_MARKERS:
+        if marker in html:
+            return marker
+    explicitly_free = (
+        "is_pay_subscribe: '0'" in html or 'is_pay_subscribe: "0"' in html
+    )
+    if WEIXIN_PAYWALL_PHRASE in html and not explicitly_free:
+        return WEIXIN_PAYWALL_PHRASE
+    for marker in WEIXIN_VERIFY_MARKERS:
+        if marker in html:
+            return marker
+    if "js_content" not in html and ("verify" in html.lower() or "captcha" in html.lower()):
+        return "verification page"
+    return None
+
+
+def _weixin_meta(html, pattern):
+    match = re.search(pattern, html or "", re.I | re.DOTALL)
+    if not match:
+        return ""
+    return html_lib.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+
+
+def extract_weixin(url):
+    """Extract a public free Weixin article. Blocked/paid/verify pages hard-fail."""
+    url = _normalize_input_url(url)
+    try:
+        html = http_get(url, headers=WEIXIN_HEADERS)
+    except Exception as e:
+        return _make_post_result(
+            {"title": "", "author": "", "duration": 0, "description": ""},
+            "weixin",
+            url,
+            error=f"Failed to fetch Weixin article: {e}",
+        )
+
+    blocked = _weixin_blocked_reason(html)
+    if blocked:
+        return _make_post_result(
+            {"title": "", "author": "", "duration": 0, "description": ""},
+            "weixin",
+            url,
+            error=f"Weixin article is not publicly readable ({blocked})",
+        )
+
+    title = (
+        _weixin_meta(html, r'id="activity-name"[^>]*>(.*?)</')
+        or _weixin_meta(html, r'property="og:title"\s+content="([^"]+)"')
+    )
+    author = (
+        _weixin_meta(html, r'id="js_name"[^>]*>(.*?)</')
+        or _weixin_meta(html, r'id="js_author_name"[^>]*>(.*?)</')
+        or _weixin_meta(html, r'property="og:article:author"\s+content="([^"]+)"')
+        or _weixin_meta(html, r'id="js_profile_qrcode"[^>]*data-nickname="([^"]+)"')
+    )
+    parser = _WeixinContentParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    body = re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+    info = {
+        "title": title,
+        "author": author,
+        "duration": 0,
+        "description": body,
+    }
+    return _finalize_post(
+        info,
+        "weixin",
+        url,
+        parser.images,
+        referer="https://mp.weixin.qq.com/",
+        user_agent=WEIXIN_HEADERS["User-Agent"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1729,7 @@ def _ytdlp_extract_subs(url, tmp_dir, platform="generic"):
         _run_ytdlp(cmd)
     except Exception as e:
         log(f"yt-dlp subtitle download failed: {e}", "WARN")
-        return None
+        return None, []
 
     sub_files = (
         glob.glob(os.path.join(tmp_dir, "*.vtt"))
@@ -1041,26 +1738,26 @@ def _ytdlp_extract_subs(url, tmp_dir, platform="generic"):
         + glob.glob(os.path.join(tmp_dir, "*.srv3"))
     )
     if not sub_files:
-        return None
+        return None, []
 
     for sf in sub_files:
-        text = _parse_subtitle_file(sf)
+        text, cues = _parse_subtitle_file(sf)
         if text:
-            return text
-    return None
+            return text, cues
+    return None, []
 
 
 def _parse_subtitle_file(filepath):
-    """Parse VTT/SRT/JSON3 subtitle file into plain text."""
+    """Parse VTT/SRT/JSON3/SRV3 subtitle file into (text, cues)."""
     ext = os.path.splitext(filepath)[1].lower()
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
     except Exception:
-        return None
+        return None, []
 
     if not content.strip():
-        return None
+        return None, []
 
     if ext == ".json3":
         return _parse_json3_subtitle(content)
@@ -1068,7 +1765,7 @@ def _parse_subtitle_file(filepath):
         return _parse_vtt_srt(content)
     elif ext == ".srv3":
         return _parse_srv3_subtitle(content)
-    return None
+    return None, []
 
 
 def _parse_json3_subtitle(content):
@@ -1076,47 +1773,79 @@ def _parse_json3_subtitle(content):
         data = json.loads(content)
         events = data.get("events", [])
         lines = []
+        cues = []
         for event in events:
             segs = event.get("segs", [])
-            text = "".join(s.get("utf8", "") for s in segs).strip()
-            if text and text != "\n":
-                lines.append(text)
-        return "\n".join(lines) if lines else None
+            text = "".join(s.get("utf8", "") or "" for s in segs).strip()
+            if not text or text == "\n":
+                continue
+            lines.append(text)
+            start_ms = event.get("tStartMs")
+            dur_ms = event.get("dDurationMs") or 0
+            if start_ms is not None:
+                cue = _make_cue(start_ms / 1000.0, (start_ms + dur_ms) / 1000.0, text)
+                if cue:
+                    cues.append(cue)
+        return ("\n".join(lines) if lines else None), cues
     except Exception:
-        return None
+        return None, []
 
 
 def _parse_srv3_subtitle(content):
     lines = []
-    for match in re.findall(r'<p[^>]*>(.*?)</p>', content, re.DOTALL):
-        text = re.sub(r'<[^>]+>', '', match).strip()
-        if text:
-            lines.append(text)
-    return "\n".join(lines) if lines else None
+    cues = []
+    for match in re.finditer(r"<p([^>]*)>(.*?)</p>", content, re.DOTALL):
+        attrs, inner = match.group(1), match.group(2)
+        text = re.sub(r"<[^>]+>", "", inner).strip()
+        if not text:
+            continue
+        lines.append(text)
+        t_match = re.search(r'\bt="(\d+)"', attrs)
+        d_match = re.search(r'\bd="(\d+)"', attrs)
+        if t_match:
+            start = int(t_match.group(1)) / 1000.0
+            duration = int(d_match.group(1)) / 1000.0 if d_match else 0
+            cue = _make_cue(start, start + duration, text)
+            if cue:
+                cues.append(cue)
+    return ("\n".join(lines) if lines else None), cues
 
 
 def _parse_vtt_srt(content):
     lines = []
+    cues = []
     seen = set()
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
+    blocks = re.split(r"\n\s*\n", content.replace("\r\n", "\n").strip())
+    for block in blocks:
+        timing = None
+        text_lines = []
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if re.match(r"^\d+$", line):
+                continue
+            if re.match(r"^WEBVTT", line):
+                continue
+            if re.match(r"^NOTE\b", line):
+                continue
+            timed = re.search(r"([\d:,.]+)\s*-->\s*([\d:,.]+)", line)
+            if timed:
+                timing = timed
+                continue
+            text_lines.append(re.sub(r"<[^>]+>", "", line).strip())
+        text = " ".join(t for t in text_lines if t)
+        if not text or text in seen:
             continue
-        if re.match(r'^\d+$', line):
-            continue
-        if re.match(r'^WEBVTT', line):
-            continue
-        if re.match(r'^NOTE\s', line):
-            continue
-        if re.match(r'^\d{2}:\d{2}', line):
-            continue
-        if '-->' in line:
-            continue
-        text = re.sub(r'<[^>]+>', '', line).strip()
-        if text and text not in seen:
-            seen.add(text)
-            lines.append(text)
-    return "\n".join(lines) if lines else None
+        seen.add(text)
+        lines.append(text)
+        if timing:
+            start = _timestamp_to_seconds(timing.group(1))
+            end = _timestamp_to_seconds(timing.group(2))
+            cue = _make_cue(start, end, text)
+            if cue:
+                cues.append(cue)
+    return ("\n".join(lines) if lines else None), cues
 
 
 def _ytdlp_download_audio(url, tmp_dir, platform="generic"):
@@ -1307,6 +2036,8 @@ def extract_keyframes(url, platform, config, play_url=None, duration=None):
             video_path = _download_douyin_audio(play_url, tmp_dir)
         elif play_url and platform == "xiaohongshu":
             video_path = _download_xhs_video(play_url, tmp_dir)
+        elif play_url and platform == "bilibili":
+            video_path = _download_bili_media(play_url, tmp_dir)
 
         if not video_path and _check_ytdlp():
             log("Downloading video for frame extraction...")
@@ -1347,9 +2078,9 @@ def extract_with_ytdlp(url, platform="generic"):
     tmp_dir = tempfile.mkdtemp(prefix="video_sub_")
     try:
         log(f"Trying yt-dlp subtitle extraction for {platform}...")
-        text = _ytdlp_extract_subs(url, tmp_dir, platform)
+        text, cues = _ytdlp_extract_subs(url, tmp_dir, platform)
         if text:
-            return _make_result(info, platform, url, text, "yt_dlp_subs")
+            return _make_result(info, platform, url, text, "yt_dlp_subs", cues=cues)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1372,15 +2103,17 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
         log("Downloading audio for Whisper transcription...")
         audio_path = None
 
-        if _check_ytdlp():
-            audio_path = _ytdlp_download_audio(url, tmp_dir, platform)
-
-        if not audio_path and play_url:
+        if play_url:
             log("Trying direct download via play_url...")
             if platform == "xiaohongshu":
                 audio_path = _download_xhs_video(play_url, tmp_dir)
+            elif platform == "bilibili":
+                audio_path = _download_bili_media(play_url, tmp_dir)
             else:
                 audio_path = _download_douyin_audio(play_url, tmp_dir)
+
+        if not audio_path and _check_ytdlp():
+            audio_path = _ytdlp_download_audio(url, tmp_dir, platform)
 
         if not audio_path:
             if not _check_ytdlp():
@@ -1390,16 +2123,16 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
             return None
 
         if whisper_mode == "api":
-            text = _whisper_api(audio_path, config)
+            text, cues = _whisper_api(audio_path, config)
         elif whisper_mode == "local":
-            text = _whisper_local(audio_path, config)
+            text, cues = _whisper_local(audio_path, config)
         else:
             log(f"Unknown whisper_mode: {whisper_mode}", "ERROR")
             return None
 
         if text:
             source = f"whisper_{whisper_mode}"
-            return _make_result(info, platform, url, text, source)
+            return _make_result(info, platform, url, text, source, cues=cues)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1407,11 +2140,11 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
 
 
 def _whisper_api(audio_path, config):
-    """Transcribe using OpenAI Whisper API."""
+    """Transcribe using OpenAI Whisper API. Returns (text, cues)."""
     api_key = config.get("openai_api_key", "")
     if not api_key:
         log("openai_api_key not configured in config.json", "ERROR")
-        return None
+        return None, []
 
     try:
         from openai import OpenAI
@@ -1430,23 +2163,43 @@ def _whisper_api(audio_path, config):
                 model="whisper-1",
                 file=f,
                 language=language,
-                response_format="text",
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
             )
-        return resp if isinstance(resp, str) else str(resp)
+        return _whisper_response_to_payload(resp)
     except ImportError:
         log("openai package not installed. Run: pip install openai", "ERROR")
     except Exception as e:
         log(f"Whisper API failed: {e}", "ERROR")
-    return None
+    return None, []
+
+
+def _whisper_response_to_payload(resp, time_offset=0.0):
+    """Normalize an OpenAI transcription response into (text, cues)."""
+    if resp is None:
+        return None, []
+    if isinstance(resp, str):
+        text = resp.strip()
+        return (text or None), []
+    segments = getattr(resp, "segments", None)
+    if segments is None and isinstance(resp, dict):
+        segments = resp.get("segments")
+    if segments:
+        return _cues_from_segments(segments, time_offset=time_offset)
+    text = getattr(resp, "text", None)
+    if text is None and isinstance(resp, dict):
+        text = resp.get("text")
+    text = (text or "").strip()
+    return (text or None), []
 
 
 def _whisper_api_chunked(audio_path, client, language):
-    """Split large audio and transcribe in chunks."""
+    """Split large audio and transcribe in chunks. Returns (text, cues)."""
     try:
         from pydub import AudioSegment
     except ImportError:
         log("pydub not installed, cannot split audio. Run: pip install pydub", "ERROR")
-        return None
+        return None, []
 
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -1454,6 +2207,7 @@ def _whisper_api_chunked(audio_path, client, language):
         chunks = [audio[i:i + chunk_ms] for i in range(0, len(audio), chunk_ms)]
 
         parts = []
+        cues = []
         for i, chunk in enumerate(chunks):
             log(f"Transcribing chunk {i + 1}/{len(chunks)}...")
             chunk_path = audio_path + f".chunk{i}.m4a"
@@ -1463,39 +2217,46 @@ def _whisper_api_chunked(audio_path, client, language):
                     model="whisper-1",
                     file=f,
                     language=language,
-                    response_format="text",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
                 )
-            text = resp if isinstance(resp, str) else str(resp)
+            text, chunk_cues = _whisper_response_to_payload(resp, time_offset=i * 600)
             if text:
                 parts.append(text.strip())
+            cues.extend(chunk_cues)
             os.unlink(chunk_path)
 
-        return "\n".join(parts) if parts else None
+        if not parts:
+            return None, []
+        return "\n".join(parts), cues
     except Exception as e:
         log(f"Chunked transcription failed: {e}", "ERROR")
-        return None
+        return None, []
 
 
 def _whisper_local(audio_path, config):
-    """Transcribe using faster-whisper (local model)."""
+    """Transcribe using faster-whisper (local model). Returns (text, cues)."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         log("faster-whisper not installed. Run: pip install faster-whisper", "ERROR")
-        return None
+        return None, []
 
     model_size = config.get("whisper_model", "base")
     language = config.get("language", "zh")
-    log(f"Loading Whisper model '{model_size}'...")
 
-    try:
-        model = WhisperModel(model_size, device="auto", compute_type="auto")
-        segments, _ = model.transcribe(audio_path, language=language)
-        lines = [seg.text.strip() for seg in segments if seg.text.strip()]
-        return "\n".join(lines) if lines else None
-    except Exception as e:
-        log(f"Local Whisper transcription failed: {e}", "ERROR")
-        return None
+    last_error = None
+    for device, compute_type in (("auto", "auto"), ("cpu", "int8")):
+        try:
+            log(f"Loading Whisper model '{model_size}' on {device}/{compute_type}...")
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            segments, _ = model.transcribe(audio_path, language=language)
+            return _cues_from_segments(segments)
+        except Exception as e:
+            last_error = e
+            log(f"Whisper {device}/{compute_type} failed: {e}", "WARN")
+    log(f"Local Whisper transcription failed: {last_error}", "ERROR")
+    return None, []
 
 
 # ---------------------------------------------------------------------------
@@ -1511,15 +2272,147 @@ def format_duration(seconds):
     return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
-def _make_result(info, platform, url, subtitle_text=None, source=None, error=None):
-    return {
+MAX_POST_IMAGES = 20
+XHS_PIC_TOKEN_RE = re.compile(
+    r"https?://sns-webpic-qc\.xhscdn\.com/\d+/[0-9a-z]+/(\S+)!"
+)
+
+
+def _make_result(
+    info,
+    platform,
+    url,
+    subtitle_text=None,
+    source=None,
+    error=None,
+    cues=None,
+    content_type="video",
+    images=None,
+    images_truncated=False,
+    images_total=None,
+):
+    result = {
         "info": info,
         "platform": platform,
         "url": url,
         "subtitle_text": subtitle_text,
         "source": source,
         "error": error,
+        "content_type": content_type,
     }
+    if cues:
+        result["cues"] = cues
+    if content_type == "post":
+        result["images"] = images or []
+        if images_truncated:
+            result["images_truncated"] = True
+            if images_total is not None:
+                result["images_total"] = images_total
+    return result
+
+
+def _make_post_result(
+    info,
+    platform,
+    url,
+    subtitle_text="",
+    images=None,
+    error=None,
+    images_truncated=False,
+    images_total=None,
+):
+    return _make_result(
+        info,
+        platform,
+        url,
+        subtitle_text=subtitle_text,
+        source="note_page",
+        error=error,
+        content_type="post",
+        images=images,
+        images_truncated=images_truncated,
+        images_total=images_total,
+    )
+
+
+def _download_file(url, dest, headers):
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        if not data or len(data) < 32:
+            return False
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(data)
+        return True
+    except Exception as e:
+        log(f"Image download failed: {e}", "WARN")
+        return False
+
+
+def _guess_image_ext(url):
+    path = urllib.parse.urlparse(url).path.lower()
+    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        if path.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    if "format/png" in url:
+        return ".png"
+    return ".jpg"
+
+
+def _download_post_images(page_url, image_urls, referer, user_agent):
+    """Download min(len, 20) images. Returns (images, truncated, total) or None on any miss."""
+    total = len(image_urls)
+    truncated = total > MAX_POST_IMAGES
+    selected = image_urls[:MAX_POST_IMAGES]
+    if not selected:
+        return [], truncated, total
+
+    dest_dir = os.path.join(IMAGES_DIR, _cache_key(page_url))
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": referer,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    images = []
+    for index, img_url in enumerate(selected, start=1):
+        dest = os.path.join(dest_dir, f"{index:02d}{_guess_image_ext(img_url)}")
+        if os.path.exists(dest) and os.path.getsize(dest) > 32:
+            images.append({"path": os.path.abspath(dest), "index": index})
+            continue
+        if not _download_file(img_url, dest, headers):
+            return None
+        images.append({"path": os.path.abspath(dest), "index": index})
+    return images, truncated, total
+
+
+def _finalize_post(info, platform, url, image_urls, referer, user_agent):
+    title = (info.get("title") or "").strip()
+    desc = (info.get("description") or "").strip()
+    subtitle_text = desc or title
+    processable = min(len(image_urls or []), MAX_POST_IMAGES)
+    if not title and processable == 0:
+        return _make_post_result(
+            info, platform, url,
+            subtitle_text=subtitle_text,
+            error="Post has no title and no images",
+        )
+    downloaded = _download_post_images(url, image_urls or [], referer, user_agent)
+    if downloaded is None:
+        return _make_post_result(
+            info, platform, url,
+            subtitle_text=subtitle_text,
+            error="Failed to download all post images",
+        )
+    images, truncated, total = downloaded
+    return _make_post_result(
+        info, platform, url,
+        subtitle_text=subtitle_text,
+        images=images,
+        images_truncated=truncated,
+        images_total=total if truncated else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +2424,8 @@ def extract(url, config):
     Main entry point. Tries cache, then platform-specific extraction,
     then yt-dlp subs, then Whisper ASR. Returns a result dict.
     """
+    url = _normalize_input_url(url)
+
     # Phase 0: check cache
     cached = _read_cache(url)
     if cached:
@@ -1551,9 +2446,16 @@ def extract(url, config):
         result = extract_douyin(url)
     elif platform == "xiaohongshu":
         result = extract_xiaohongshu(url)
+    elif platform == "weixin":
+        result = extract_weixin(url)
 
     if result:
         play_url = result.get("_play_url")
+
+    if result and result.get("content_type") == "post":
+        if not result.get("error"):
+            _write_cache(url, result)
+        return result
 
     final_result = None
 
@@ -1569,9 +2471,12 @@ def extract(url, config):
                 if ytdlp_result.get("subtitle_text"):
                     if not info.get("title") and ytdlp_result["info"].get("title"):
                         info = ytdlp_result["info"]
-                    final_result = _make_result(info, platform, url,
-                                                ytdlp_result["subtitle_text"],
-                                                ytdlp_result["source"])
+                    final_result = _make_result(
+                        info, platform, url,
+                        ytdlp_result["subtitle_text"],
+                        ytdlp_result["source"],
+                        cues=ytdlp_result.get("cues"),
+                    )
                 if not info.get("title") and ytdlp_result["info"].get("title"):
                     info = ytdlp_result["info"]
         else:
@@ -1616,9 +2521,9 @@ def extract(url, config):
 
 
 def _clear_cache():
-    """Remove all cached results and screenshots."""
+    """Remove cached results, screenshots, and downloaded images."""
     removed = 0
-    for d in [CACHE_DIR, SCREENSHOTS_DIR]:
+    for d in [CACHE_DIR, SCREENSHOTS_DIR, IMAGES_DIR]:
         if os.path.isdir(d):
             removed += sum(len(files) for _, _, files in os.walk(d))
             shutil.rmtree(d, ignore_errors=True)
@@ -1631,15 +2536,15 @@ def main():
         return
 
     if len(sys.argv) < 2:
-        print("Usage: python video_subtitle.py <URL>", file=sys.stderr)
-        print("       python video_subtitle.py --clear-cache", file=sys.stderr)
-        print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, and 1800+ sites", file=sys.stderr)
+        print("Usage: python extract_content.py <URL>", file=sys.stderr)
+        print("       python extract_content.py --clear-cache", file=sys.stderr)
+        print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, Weixin, and 1800+ sites", file=sys.stderr)
         sys.exit(1)
 
-    url = sys.argv[1]
+    url = _normalize_input_url(sys.argv[1])
     config = load_config()
 
-    log(f"Extracting subtitles for: {url}")
+    log(f"Extracting content for: {url}")
     result = extract(url, config)
 
     if not result:
@@ -1647,14 +2552,17 @@ def main():
         sys.exit(1)
 
     info = result.get("info", {})
+    content_type = result.get("content_type", "video")
     output = {
+        "content_type": content_type,
         "title": info.get("title", ""),
         "author": info.get("author", ""),
-        "duration": format_duration(info.get("duration", 0)),
         "description": info.get("description", ""),
         "platform": result.get("platform", "unknown"),
         "url": result.get("url", url),
     }
+    if content_type != "post":
+        output["duration"] = format_duration(info.get("duration", 0))
 
     if result.get("error"):
         output["error"] = result["error"]
@@ -1662,13 +2570,22 @@ def main():
         sys.exit(1)
 
     output["source"] = result.get("source", "unknown")
-    output["subtitle_text"] = result["subtitle_text"]
+    output["subtitle_text"] = result.get("subtitle_text") or ""
 
-    if result.get("frames"):
-        output["frames"] = [
-            {"path": f["path"], "timestamp": format_duration(int(f["timestamp"]))}
-            for f in result["frames"]
-        ]
+    if content_type == "post":
+        output["images"] = result.get("images") or []
+        if result.get("images_truncated"):
+            output["images_truncated"] = True
+            if result.get("images_total") is not None:
+                output["images_total"] = result["images_total"]
+    else:
+        if result.get("cues"):
+            output["cues"] = result["cues"]
+        if result.get("frames"):
+            output["frames"] = [
+                {"path": f["path"], "timestamp": format_duration(int(f["timestamp"]))}
+                for f in result["frames"]
+            ]
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
 

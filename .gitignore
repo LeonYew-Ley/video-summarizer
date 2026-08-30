@@ -1,5 +1,6 @@
 cache/
 screenshots/
+images/
 __pycache__/
 *.pyc
 *cookies*.txt

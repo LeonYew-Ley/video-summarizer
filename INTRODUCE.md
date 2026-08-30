@@ -1,160 +1,130 @@
-# Multi-Video-Summarizer 项目介绍
+# Social Summarizer 项目介绍
 
 ## 这是什么
 
-Multi-Video-Summarizer 是一个 **AI Agent Skill**（AI 代理技能），用于 Cursor IDE 和 Claude Code。当你在对话中粘贴一个视频链接（B站、YouTube、抖音等），AI 会自动识别并调用这个技能，提取视频字幕/转录文本，然后生成带有截图的结构化笔记。
+Social Summarizer 是一个 **AI Agent Skill**，给 Cursor / Claude Code 用。仓库目录名仍是 `video-summarizer`，Skill 的 `name` 是 `social-summarizer`。
+
+用户粘贴视频或图文链接后，AI 先跑本地脚本抽出 JSON，再按 `content_type` 写成笔记。脚本自己不会「写完整笔记」。
 
 ## 工作原理
 
 ```
-用户粘贴视频链接
+用户粘贴链接（视频或图文）
        |
        v
-AI 读取 SKILL.md，识别到这是视频总结任务
+AI 读取 SKILL.md
        |
        v
-AI 调用 video_subtitle.py 提取字幕
+python extract_content.py "<URL>"
        |
        v
-   ┌───────────────────────────────────────────┐
-   │          三层提取策略（自动降级）            │
-   │                                           │
-   │  1. 平台专属 API（B站公开API / YouTube字幕） │
-   │            |（失败则继续）                   │
-   │  2. yt-dlp 字幕提取（通用方案）             │
-   │            |（失败则继续）                   │
-   │  3. Whisper 语音识别（下载音频后转文字）     │
-   └───────────────────────────────────────────┘
+   平台 + 页面数据判断类型
+       |
+   ┌───┴────┐
+   v        v
+ 视频      图文
+ API/字幕   正文 + 下图
+ yt-dlp     最多 20 张必须下齐
+ Whisper
+ 关键帧
        |
        v
-   同时下载低画质视频 → ffmpeg 提取关键帧截图
+ stdout JSON（content_type = video | post）
        |
        v
-   输出 JSON（标题、作者、字幕文本、截图路径）
-       |
-       v
-   AI 根据 SKILL.md 中的模板生成 BibiGPT 风格的 Markdown 笔记
+ AI 按对应模板写 Markdown 笔记
 ```
 
 ## 文件说明
 
 ### 核心文件
 
-| 文件 | 大小 | 作用 |
-|---|---|---|
-| `SKILL.md` | ~9KB | **技能入口文件**。Cursor/Claude 通过扫描此文件发现技能。包含触发条件（哪些 URL 模式会激活）、工作流程（调用脚本的命令）、输出模板（BibiGPT 风格的 Markdown 格式）。这是 AI "看到的说明书"。 |
-| `video_subtitle.py` | ~60KB | **核心提取脚本**（约1700行）。负责：平台检测（URL → bilibili/youtube/douyin/xiaohongshu/...）、B站公开 API 调用（含 WBI 签名）、YouTube 字幕 API、抖音分享页解析和直接下载、**小红书移动端页面解析和视频直接下载**（从 `__SETUP_SERVER_STATE__` 提取元数据和 CDN 视频地址）、yt-dlp 通用字幕提取、Whisper 语音识别（本地/API）、ffmpeg 关键帧提取、结果缓存。输出 JSON 到 stdout。 |
-| `config.json` | ~335B | **用户配置文件**。控制 Whisper 模式（`disabled`/`local`/`api`）、OpenAI API Key、Whisper 模型大小、语言、是否提取截图、每个视频截图数量。用户根据需要修改。 |
-| `requirements.txt` | ~800B | **依赖清单**。列出所有可选的 pip 包。不会自动安装，用户按需安装。B站视频不需要任何额外依赖。 |
+| 文件 | 作用 |
+|---|---|
+| `SKILL.md` | 技能入口。`name: social-summarizer`。先跑脚本，再按 `content_type` 选视频时间轴模板或图文模板。触发词含总结视频 / 总结图文 / 总结笔记 / 总结帖子 / 总结公众号。 |
+| `extract_content.py` | 唯一抽取入口。平台检测、B站 API、YouTube 字幕、抖音分享页/SEO 图文、小红书笔记（视频或图文）、微信公开免费文、yt-dlp、Whisper、ffmpeg 关键帧、按 URL 哈希缓存。 |
+| `config.json` | Whisper、截图、缓存天数。 |
+| `requirements.txt` | 可选 pip 依赖。B站和图文抽取可以不装。 |
 
-### 文档文件
+### 文档
 
 | 文件 | 作用 |
 |---|---|
-| `README.md` | 英文版使用文档。包含安装、配置、依赖、故障排查等完整说明。面向 GitHub 开源。 |
-| `README_CN.md` | 中文版使用文档。内容与 README.md 相同。 |
-| `INTRODUCE.md` | 本文件。项目架构和文件说明。 |
+| `README.md` | 英文使用说明 |
+| `README_CN.md` | 中文使用说明 |
+| `INTRODUCE.md` | 本文件 |
 
-### 配置文件
+### 运行时目录（不入 Git）
 
-| 文件 | 作用 |
+| 目录 | 说明 |
 |---|---|
-| `.gitignore` | 排除运行时产物：`cache/`（缓存）、`screenshots/`（截图）、`__pycache__/`、Cookie 文件、`.bak` 备份文件。确保 Git 仓库只包含源代码。 |
+| `cache/` | `<url_hash>.json`，默认 7 天过期。图文正文必须写入 `subtitle_text` 才能命中。 |
+| `screenshots/` | 视频关键帧 |
+| `images/` | 图文配图 `<url_hash>/01.png` … |
+| `__pycache__/` | Python 字节码 |
 
-### 自动生成的目录（运行时创建，不入 Git）
+`.gitignore` 排除 `cache/`、`screenshots/`、`images/`、Cookie、`.bak`。
 
-| 目录 | 内容 | 说明 |
-|---|---|---|
-| `cache/` | `<url_hash>.json` | 缓存提取结果。以视频 URL 的哈希值为文件名，存储标题、作者、字幕文本、提取方式等。下次请求同一视频时直接读取缓存，无需重新下载。**默认 7 天过期**（通过 `cache_ttl_days` 配置）。 |
-| `screenshots/` | `<url_hash>/frame_001.jpg` ... | 关键帧截图。每个视频一个子目录，包含 N 张均匀分布的 JPEG 截图（默认6张）。**与缓存同步过期**。可通过 `python video_subtitle.py --clear-cache` 手动清除全部缓存和截图。 |
-| `__pycache__/` | `.pyc` 文件 | Python 字节码缓存，自动生成，无需关注。 |
+`python extract_content.py --clear-cache` 会同时删掉上述三个数据目录。
 
-## config.json 字段详解
+## JSON 契约
 
-```json
-{
-    "whisper_mode": "disabled",   // "disabled"=仅字幕 | "local"=本地Whisper | "api"=OpenAI API
-    "openai_api_key": "",         // OpenAI API Key，仅 api 模式需要
-    "whisper_model": "base",      // 本地模型大小：tiny < base < small < medium < large
-    "language": "zh",             // 语音识别语言提示（ISO 639-1）
-    "extract_frames": true,       // 是否提取关键帧截图
-    "frames_per_video": 6,        // 每个视频提取几张截图
-    "cache_ttl_days": 7           // 缓存保留天数，0=永久。过期后自动重新提取
-}
-```
+- `content_type` 只有 `video` 和 `post`
+- 视频保留旧字段；有时间信息时额外输出 `cues: [{start, end, text}]`（秒）
+- 图文：`title` / `author` / `description` / `platform` / `url` / `source` / `subtitle_text` / `images`
+- 图文 `platform`：`xiaohongshu` | `douyin` | `weixin`
+- 视频 `platform`：`bilibili` | `youtube` | `douyin` | `xiaohongshu` | `tiktok` | `generic`
+- 超过 20 张图：`images_truncated: true` 并带原张数；前 20 张必须下齐
 
-## 依赖关系一览
+## 类型判断
 
-```
-只看B站视频？        → 无需安装任何依赖
-要看YouTube？        → pip install youtube-transcript-api
-要看抖音？           → 无需额外依赖（直接 API 解析）
-要看小红书？         → 无需额外依赖（直接页面解析 + CDN 下载）
-要看TikTok/其他？    → pip install yt-dlp
-视频没字幕？         → pip install faster-whisper（本地）
-                      或 pip install openai（API，需要Key）
-要截图功能？         → 安装 ffmpeg + pip install Pillow
-全部都要？           → pip install youtube-transcript-api yt-dlp faster-whisper openai pydub Pillow
-```
+以页面数据为准：
 
-## 提取策略详解
+- **小红书**：`type == video` 或有 `play_url` → 视频；否则图文。下图用 `sns-webpic-qc` token 拼 `ci.xiaohongshu.com`
+- **抖音**：`/note/`、`images` 非空、或 `aweme_type` 为 68/2 → 图文。分享页若不再内嵌 `item_list`，改读公开 SEO 快照里的 `aweme_images`
+- **微信**：`mp.weixin.qq.com` → 图文。`is_pay_subscribe: '1'`、付费阅读、关注可见、验证码、环境异常 → `error`。免费文里也可能出现 `pay_subscribe_info` 且值为 `'0'`，不能据此误杀
+- **B站 / YouTube / TikTok / generic** → 视频
 
-### B站（Bilibili）
+## 提取策略
 
-使用公开 API，无需登录或 Cookie：
-1. 通过 WBI 签名的 Player V2 API 获取字幕
-2. 页面 HTML 中嵌入的字幕信息
-3. B站 AI 总结接口
+### B站
+
+公开 API，无需登录：Player V2 字幕、页内字幕、AI 总结。
 
 ### YouTube
 
-1. `youtube-transcript-api` 库获取字幕轨道
-2. yt-dlp 字幕提取
-3. Whisper 语音识别（需配置）
+`youtube-transcript-api` → yt-dlp → Whisper。官方字幕或 Whisper 分段都会进 `cues`。
 
-### 抖音（Douyin）
+### 抖音
 
-1. 解析 `iesdouyin.com/share` 移动端页面，提取视频元数据和直接下载链接
-2. 自动生成必要的 Cookie（`s_v_web_id`、`ttwid`）
-3. 直接下载视频用于 Whisper 转录
+- 图文：`iesdouyin.com/share/note/{id}`；SSR 空壳时用公开 SEO 页拿标题、作者和图片
+- 视频：分享页 `play_url`、yt-dlp、Whisper。`/video/` 不得误走图文
 
-### 小红书（Xiaohongshu）
+### 小红书
 
-1. 使用移动端 UA 请求分享页，跟随 `xhslink.com` 短链重定向
-2. 从页面 `window.__SETUP_SERVER_STATE__` 解析笔记数据（标题、描述、作者、时长）
-3. 从 `media.stream` 中提取视频 CDN 直链（h264/h265 masterUrl），直接下载 MP4
-4. 下载视频后用于 Whisper 转录和 ffmpeg 关键帧提取
-5. **全程无需 Cookie 或登录**
+- 跟随 `xhslink.com` 的 `Location`（不自动跟跳）
+- `__SETUP_SERVER_STATE__` 优先，否则 `__INITIAL_STATE__` → `note.noteDetailMap`
+- 图文下图：token → `https://ci.xiaohongshu.com/{token}?imageView2/2/w/0/format/png`；失败再退 `urlDefault` / `urlPre`
+- 探索页 / 笔记链接必须带刚从网页复制的 `xsec_token`；`xsec_source` 有就原样保留。过期 token 会 404 / 300031
 
-### 其他平台
+### 微信公众号
 
-统一通过 yt-dlp 处理，支持 1800+ 网站。
+`#activity-name` / og:title，`#js_name`，`#js_content` 正文与 `data-src` 配图。只抽公开免费文。
 
-## 输出示例
+### 其他
 
-脚本输出 JSON，AI 将其转换为如下 Markdown 笔记：
+yt-dlp，1800+ 站点。
+
+## 笔记模板（Agent 层）
+
+视频：章节标题下一行引用时间轴。
 
 ```markdown
-# AI 一键总结：[视频标题](视频链接)
-
-### 🏷️ 章节标题
-![章节标题](截图路径)
-- 要点1
-- 要点2
-
-### 💡 章节标题
-![章节标题](截图路径)
-- 要点3
-- 要点4
-
-### Summary
-- 全文摘要
-
-### Highlights
-*   🧠 亮点1 [#标签1] [#标签2]
-*   🎯 亮点2 [#标签1] [#标签2]
-
-### Questions
-*   延伸思考问题1
-*   延伸思考问题2
+### 主题标题
+> 03:12 – 07:45
+- 要点
 ```
+
+无 `cues`（没有带时间的字幕，且 Whisper 也没分段）时写 `> 无时间轴` 并说明原因。
+
+图文：标题+链接+作者；原文要点；按图序嵌本地图；Summary / Highlights / Questions。不写时间戳，不按口播假设。
