@@ -2,274 +2,110 @@
 
 # Social Summarizer
 
-An AI agent skill that extracts **videos** or **image-text posts** and writes structured notes. Works with **Cursor** and **Claude Code**. The GitHub / local folder name stays `video-summarizer`; the skill `name` is `social-summarizer`.
+An AI Agent Skill for Cursor and Claude Code: paste a video or image-text post URL, and the agent extracts the content and writes a structured note.
 
-Run `extract_content.py` first. Then pick the note template from `content_type` (`video` or `post`). Do not guess the type from wording.
+It supports subtitle retrieval, Whisper transcription, video keyframes, post images, and URL-based caching. Both the repository and Skill are named `social-summarizer`.
 
 ## Supported Platforms
 
-| Platform | URL Examples | Kind | Extraction Method | Extra Dependencies |
-|---|---|---|---|---|
-| **Bilibili** (B站) | `bilibili.com/video/BVxxx` | video | Public API (WBI signing) | None (stdlib only) |
-| **YouTube** | `youtube.com/watch?v=xxx`, `youtu.be/xxx` | video | `youtube-transcript-api` | `pip install youtube-transcript-api` |
-| **Douyin** (抖音) | `douyin.com/video/`, `v.douyin.com/` | video | Share page + yt-dlp / Whisper | `pip install yt-dlp` (optional) |
-| **Douyin notes** | `douyin.com/note/`, share `/note/` | post | Public SEO snapshot of the share page | None |
-| **Xiaohongshu** (小红书) | `xiaohongshu.com/`, `xhslink.com/` | video or post | Page parse (`__SETUP_SERVER_STATE__` / `__INITIAL_STATE__`) | None for extract; Whisper for video transcript |
-| **Weixin** (公众号) | `mp.weixin.qq.com/s/` | post | Public free article HTML | None |
-| **TikTok** | `tiktok.com/@user/video/xxx` | video | yt-dlp | `pip install yt-dlp` |
-| **1800+ other sites** | Any URL supported by yt-dlp | video | yt-dlp | `pip install yt-dlp` |
-
-## Features
-
-- **One script, two flows**: URL / page data decides `video` vs `post`
-- **Video fallback**: platform API → yt-dlp subtitles → Whisper
-- **Timed cues**: when platform subs, VTT, or Whisper segments exist, JSON includes `cues` for chapter timelines
-- **Posts**: title, author, body in `subtitle_text`, local images (max 20, all must download)
-- **Xiaohongshu images**: `ci.xiaohongshu.com/{token}` rewrite; Live Photo video tracks are skipped
-- **Weixin**: public free articles only; paywall / verify / follow-to-read hard-fail with `error`
-- **Keyframe screenshots** for video when ffmpeg is installed
-- **Cache** by URL hash; `--clear-cache` deletes `cache/`, `screenshots/`, and `images/`
-
-## Quick Start
-
-1. **Download** the skill into the correct directory (see [Installation](#installation))
-2. **Install dependencies** for the platforms you need (see [Dependencies](#dependencies))
-3. **Paste a URL** (video or post) into Cursor or Claude — the agent runs `extract_content.py` and writes the matching template
-
-## Xiaohongshu URLs: `xsec_token` is required
-
-Explore / note links **must include a fresh `xsec_token`**. Copy the **full URL** from the Xiaohongshu website (discovery feed card or an opened note), for example:
-
-```
-https://www.xiaohongshu.com/explore/<note_id>?xsec_token=AB...=&xsec_source=pc_feed
-```
-
-| Query | Required? | Notes |
+| Platform | Kind | Extra dependency or limitation |
 |---|---|---|
-| `xsec_token` | **Yes** | One-time access token for that open/share. Stale or reconstructed tokens typically 404, `error_code=300031`, or “该内容暂时无法查看”. The script cannot mint this value. |
-| `xsec_source` | Keep if present | Source tag (`pc_feed`, etc.). Not always fatal if missing, but do not strip it when copying. |
+| Bilibili | Video | None |
+| YouTube | Video | `youtube-transcript-api` |
+| Douyin | Video, post | Videos may need `yt-dlp` or Whisper |
+| Xiaohongshu | Video, post | URL must include a valid `xsec_token`; video transcription needs Whisper |
+| Weixin | Post | Public free articles only |
+| TikTok | Video | `yt-dlp` |
+| Other yt-dlp sites | Video | `yt-dlp` |
 
-How to get it: open [xiaohongshu.com/explore](https://www.xiaohongshu.com/explore), click a note or copy the card link, paste the entire address. Short links (`xhslink.com` / share text) can be followed; the landing page still needs a valid token.
+## Installation and Usage
 
-## Installation
+This Skill is not a pip package. Copy the following block to the agent in your current environment:
 
-This skill is **not** a pip package. Cursor/Claude discovers it via `SKILL.md`. Clone or extract the folder to a skills path.
+```text
+Install Social Summarizer as my user-level Agent Skill.
 
-### For Cursor IDE
+Repo: https://github.com/LeonYew-Ley/social-summarizer
+Skill name: social-summarizer
+
+Requirements:
+1. Install it in this environment's user-level skills directory (this is not a pip package).
+2. A plain git clone is enough. Name the folder social-summarizer; its root must contain SKILL.md and extract_content.py.
+3. After installation, report the final path and any dependencies still missing for the current platform.
+```
+
+After installation, paste a supported URL into Cursor or Claude. The agent runs the extractor and writes the appropriate note for the detected content type.
+
+To get JSON directly from a terminal:
 
 ```bash
-git clone https://github.com/LeonYew-Ley/video-summarizer.git \
-    ~/.cursor/skills/social-summarizer
+python extract_content.py "https://example.com/video-or-post"
 ```
 
-Or download the ZIP and extract to `~/.cursor/skills/social-summarizer/`.
-
-**Windows path**: `%USERPROFILE%\.cursor\skills\social-summarizer\`
-
-### For Claude Code / Claude Desktop
-
-```bash
-git clone https://github.com/LeonYew-Ley/video-summarizer.git \
-    ~/.claude/skills/social-summarizer
-```
-
-**Windows path**: `%USERPROFILE%\.claude\skills\social-summarizer\`
-
-### How the AI Discovers the Skill
-
-Cursor and Claude scan skills directories for `SKILL.md`. Triggers include platform URLs and Chinese phrases such as 总结视频 / 总结图文 / 总结笔记 / 总结帖子 / 总结公众号. The agent reads `SKILL.md`, runs `extract_content.py`, then formats notes from `content_type`.
-
-## Dependencies
-
-Install **only** what you need, in your normal Python environment.
-
-### Required
-
-- **Python 3.8+** — `python --version`
-
-### Per-Platform Dependencies
-
-| What you want | Install command |
-|---|---|
-| Bilibili videos | Nothing — stdlib |
-| YouTube videos | `pip install youtube-transcript-api` |
-| Douyin / Xiaohongshu / Weixin posts | Nothing for metadata + images |
-| Douyin / Xiaohongshu videos | Whisper or yt-dlp for transcription |
-| TikTok / other sites | `pip install yt-dlp` |
-
-### Optional: Whisper (videos without subtitles)
-
-| Mode | Install command | Notes |
-|---|---|---|
-| Local (free, offline) | `pip install faster-whisper` | Downloads a model (~150MB–3GB) |
-| OpenAI API (fast, paid) | `pip install openai` | Requires API key, ~$0.006/min |
-| Audio splitting (API mode) | `pip install pydub` | Long audio upload limits |
-
-### Optional: Keyframe Screenshots
-
-| Tool | Install command | Notes |
-|---|---|---|
-| ffmpeg | See [ffmpeg installation](#install-ffmpeg) | Video frames |
-| Pillow | `pip install Pillow` | Optional image optimization |
-
-### Install Everything at Once
-
-```bash
-pip install youtube-transcript-api yt-dlp faster-whisper openai pydub Pillow
-```
-
-### Install ffmpeg
-
-Needed for video keyframe screenshots. If missing, the skill falls back to text-only video notes.
-
-**Windows:** `winget install ffmpeg`
-
-**macOS:** `brew install ffmpeg`
-
-**Linux (Ubuntu/Debian):** `sudo apt install ffmpeg`
-
-## Configuration
-
-Edit `config.json` in the skill directory:
-
-```json
-{
-    "whisper_mode": "disabled",
-    "openai_api_key": "",
-    "whisper_model": "base",
-    "language": "zh",
-    "extract_frames": true,
-    "frames_per_video": 6,
-    "cache_ttl_days": 7
-}
-```
-
-| Field | Values | Description |
-|---|---|---|
-| `whisper_mode` | `"disabled"` / `"local"` / `"api"` | Speech recognition. Default `"disabled"`. |
-| `openai_api_key` | `"sk-..."` | Only for `whisper_mode: "api"`. |
-| `whisper_model` | `"tiny"` … `"large"` | Local model size. `"base"` is balanced. |
-| `language` | `"zh"` / `"en"` / … | Whisper hint ([ISO 639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes)). |
-| `extract_frames` | `true` / `false` | Video keyframes. Default `true`. |
-| `frames_per_video` | `1`–`20` | Evenly spaced frames. Default `6`. |
-| `cache_ttl_days` | `0`–`365` | Cache / screenshot / image TTL. `0` = keep forever. |
-
-## Cookie Setup (TikTok and some videos)
-
-**Bilibili, public Weixin articles, and most Xiaohongshu / Douyin posts do not need cookies.** TikTok and some video downloads may. If extraction fails:
-
-1. Install "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)"
-2. Visit the site in a browser
-3. Export and save as `cookies.txt` in the skill directory
-
-The script also accepts `www.douyin.com_cookies.txt`, `www.xiaohongshu.com_cookies.txt`, and `www.tiktok.com_cookies.txt`.
-
-> **Windows**: Chrome 127+ DPAPI often blocks `yt-dlp --cookies-from-browser`. Export a file instead.
-
-See [Xiaohongshu URLs: `xsec_token` is required](#xiaohongshu-urls-xsec_token-is-required).
-
-## Output Format
-
-`extract_content.py` prints JSON to stdout.
-
-**Video** (`content_type` is always `video`):
-
-```json
-{
-    "content_type": "video",
-    "title": "Video Title",
-    "author": "Uploader Name",
-    "duration": "00:19",
-    "description": "Video description",
-    "platform": "youtube",
-    "url": "https://...",
-    "source": "yt_dlp_subs",
-    "subtitle_text": "Full transcript...",
-    "cues": [
-        {"start": 1.2, "end": 3.36, "text": "All right, so here we are..."}
-    ],
-    "frames": [
-        {"path": "/absolute/path/to/frame_001.jpg", "timestamp": "00:45"}
-    ]
-}
-```
-
-**Post** (`content_type` is always `post`):
-
-```json
-{
-    "content_type": "post",
-    "title": "Note title",
-    "author": "Author",
-    "description": "Caption or article body",
-    "platform": "xiaohongshu",
-    "url": "https://...",
-    "source": "note_page",
-    "subtitle_text": "Caption or article body",
-    "images": [
-        {"path": "/absolute/path/to/images/<hash>/01.png", "index": 1}
-    ]
-}
-```
-
-| Field | Description |
-|---|---|
-| `content_type` | `video` or `post` only |
-| `cues` | Timed segments in seconds. Video only, when timing exists |
-| `images` | Local post images. Empty list if none |
-| `images_truncated` | `true` plus original count when the page had more than 20 images |
-| `frames` | Video keyframes when ffmpeg + `extract_frames` |
-| `error` | Present when extraction failed |
-
-The agent then writes Markdown: video chapters use `> mm:ss – mm:ss` under each heading; posts use a separate figure-by-figure template.
-
-## File Structure
-
-```
-social-summarizer/
-├── SKILL.md              # Skill definition
-├── extract_content.py    # Extraction script
-├── config.json           # User configuration
-├── requirements.txt      # Optional pip list
-├── README.md             # English docs
-├── README_CN.md          # Chinese docs
-├── INTRODUCE.md          # Architecture
-├── .gitignore            # cache, screenshots, images, cookies
-├── cache/                # (auto) extraction JSON
-├── screenshots/          # (auto) video frames
-└── images/               # (auto) post images
-```
-
-## Standalone Usage
-
-```bash
-python extract_content.py "https://www.bilibili.com/video/BV1xxxxxx"
-python extract_content.py "https://mp.weixin.qq.com/s/xxxxxxxx"
-```
-
-```bash
-python extract_content.py "https://youtu.be/xxxxx" | jq '.content_type, .title, .source'
-```
-
-Clear cache, screenshots, and post images:
+To clear cached results, video frames, and post images:
 
 ```bash
 python extract_content.py --clear-cache
 ```
 
+## Dependencies and Configuration
+
+Python 3.8+ is required. Install other dependencies only when needed:
+
+| Purpose | Install or prepare |
+|---|---|
+| YouTube transcripts | `pip install youtube-transcript-api` |
+| TikTok, other sites, or some video downloads | `pip install yt-dlp` |
+| Local Whisper | `pip install faster-whisper` |
+| OpenAI Whisper API | `pip install openai`; add `pydub` for long audio if needed |
+| Video keyframes | Install ffmpeg; `pip install Pillow` is optional |
+
+ffmpeg commands: Windows `winget install ffmpeg`, macOS `brew install ffmpeg`, Ubuntu/Debian `sudo apt install ffmpeg`.
+
+`config.json` is optional; the defaults work without editing it. Common fields:
+
+| Field | Description |
+|---|---|
+| `whisper_mode` | `disabled`, `local`, or `api` |
+| `openai_api_key` | Required only in API mode |
+| `whisper_model` | Local model; defaults to `base` |
+| `language` | Whisper language hint; defaults to `zh` |
+| `extract_frames` | Whether to extract video keyframes |
+| `frames_per_video` | Number of keyframes; defaults to 6 |
+| `cache_ttl_days` | Cache lifetime; `0` keeps files forever |
+
 ## Troubleshooting
+
+### Xiaohongshu 404 / 300031
+
+Explore and note URLs must include a fresh `xsec_token` copied from the website:
+
+```text
+https://www.xiaohongshu.com/explore/<note_id>?xsec_token=AB...=&xsec_source=pc_feed
+```
+
+- Do not reconstruct or remove `xsec_token`; an expired token usually returns 404 or `error_code=300031`.
+- Keep `xsec_source` when present. Short links can redirect, but the final page still needs a valid token.
+
+### Do I need cookies?
+
+Bilibili, public Weixin articles, and most Douyin or Xiaohongshu posts do not need cookies. If TikTok or a video download fails, export `cookies.txt` with [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) and place it in the Skill root.
+
+The script also recognizes `www.douyin.com_cookies.txt`, `www.xiaohongshu.com_cookies.txt`, and `www.tiktok.com_cookies.txt`. Chrome 127+ on Windows may block `yt-dlp --cookies-from-browser`; exporting a file is more reliable.
+
+### Other problems
 
 | Problem | Solution |
 |---|---|
-| "No subtitles or transcript could be extracted" | Enable Whisper in `config.json` |
-| YouTube 403 | VPN or retry; IP may be blocked |
-| Douyin **note** fails | Share SSR may be empty; the script falls back to the public SEO snapshot. `/note/` must stay `post`, not video |
-| Douyin **video** fails | Export cookies or enable Whisper |
-| Xiaohongshu 404 / 300031 | Use a fresh share / explore URL with a live `xsec_token` |
-| Weixin `error` | Paywall, follow-to-read, captcha, or environment check — not extracted |
-| `yt-dlp` not found | `pip install yt-dlp` (or `python -m yt_dlp`) |
-| No screenshots | Install ffmpeg. Optional |
-| Stale cache | `python extract_content.py --clear-cache` |
+| No transcript | Enable Whisper in `config.json` |
+| YouTube 403 | Retry or change networks; the current IP may be restricted |
+| Douyin video fails | Export cookies or enable Whisper |
+| Weixin returns `error` | Paywalls, follow-to-read, captchas, and environment checks are unsupported |
+| `yt-dlp` not found | Run `pip install yt-dlp` |
+| No video keyframes | Install ffmpeg |
+| Stale cache | Run `python extract_content.py --clear-cache` |
+
+See [INTRODUCE.md](INTRODUCE.md) for the workflow, type detection, and JSON contract.
 
 ## License
 
