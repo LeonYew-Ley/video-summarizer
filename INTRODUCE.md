@@ -105,7 +105,7 @@ python extract_content.py "<URL>"
 - 跟随 `xhslink.com` 的 `Location`（不自动跟跳）
 - `__SETUP_SERVER_STATE__` 优先，否则 `__INITIAL_STATE__` → `note.noteDetailMap`
 - 图文下图：token → `https://ci.xiaohongshu.com/{token}?imageView2/2/w/0/format/png`；失败再退 `urlDefault` / `urlPre`
-- 探索页链接需要新鲜 `xsec_token`
+- 探索页 / 笔记链接必须带刚从网页复制的 `xsec_token`；`xsec_source` 有就原样保留。过期 token 会 404 / 300031
 
 ### 微信公众号
 

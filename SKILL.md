@@ -74,6 +74,8 @@ python "<skill_path>/extract_content.py" "<URL>"
 
 Replace `<skill_path>` with the absolute path to this skill's directory, and `<URL>` with the link provided by the user.
 
+**Xiaohongshu:** The URL **must include a fresh `xsec_token`** copied from the live web page (explore card or opened note), e.g. `https://www.xiaohongshu.com/explore/<id>?xsec_token=...&xsec_source=pc_feed`. Keep `xsec_source` if it is already on the link. Do not reconstruct or reuse an expired token. If the user pasted a bare `/explore/<id>` without `xsec_token`, ask them to recopy the full URL from the site.
+
 The script automatically:
 1. Detects the platform and page type from the URL / page data
 2. For video: tries platform subtitle APIs, then yt-dlp subs, then Whisper

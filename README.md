@@ -36,6 +36,21 @@ Run `extract_content.py` first. Then pick the note template from `content_type` 
 2. **Install dependencies** for the platforms you need (see [Dependencies](#dependencies))
 3. **Paste a URL** (video or post) into Cursor or Claude — the agent runs `extract_content.py` and writes the matching template
 
+## Xiaohongshu URLs: `xsec_token` is required
+
+Explore / note links **must include a fresh `xsec_token`**. Copy the **full URL** from the Xiaohongshu website (discovery feed card or an opened note), for example:
+
+```
+https://www.xiaohongshu.com/explore/<note_id>?xsec_token=AB...=&xsec_source=pc_feed
+```
+
+| Query | Required? | Notes |
+|---|---|---|
+| `xsec_token` | **Yes** | One-time access token for that open/share. Stale or reconstructed tokens typically 404, `error_code=300031`, or “该内容暂时无法查看”. The script cannot mint this value. |
+| `xsec_source` | Keep if present | Source tag (`pc_feed`, etc.). Not always fatal if missing, but do not strip it when copying. |
+
+How to get it: open [xiaohongshu.com/explore](https://www.xiaohongshu.com/explore), click a note or copy the card link, paste the entire address. Short links (`xhslink.com` / share text) can be followed; the landing page still needs a valid token.
+
 ## Installation
 
 This skill is **not** a pip package. Cursor/Claude discovers it via `SKILL.md`. Clone or extract the folder to a skills path.
@@ -151,7 +166,7 @@ The script also accepts `www.douyin.com_cookies.txt`, `www.xiaohongshu.com_cooki
 
 > **Windows**: Chrome 127+ DPAPI often blocks `yt-dlp --cookies-from-browser`. Export a file instead.
 
-Xiaohongshu explore links need a **fresh** `xsec_token` from a share / live web page. Stale tokens often 404.
+See [Xiaohongshu URLs: `xsec_token` is required](#xiaohongshu-urls-xsec_token-is-required).
 
 ## Output Format
 

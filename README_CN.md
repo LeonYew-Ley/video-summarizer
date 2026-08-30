@@ -36,6 +36,21 @@
 2. **按需安装依赖**（参见 [依赖安装](#依赖安装)）
 3. **粘贴链接**（视频或图文）到 Cursor / Claude，AI 会跑脚本并按模板写笔记
 
+## 小红书链接必须带 `xsec_token`
+
+发现页 / 笔记链接**必须带刚复制的 `xsec_token`**。从网页（发现流卡片或已打开的笔记）复制**整段 URL**，例如：
+
+```
+https://www.xiaohongshu.com/explore/<笔记ID>?xsec_token=AB...=&xsec_source=pc_feed
+```
+
+| 参数 | 要不要带 | 说明 |
+|---|---|---|
+| `xsec_token` | **必须** | 这一次打开/分享的访问凭证。过期或手拼的 token 常 404、`error_code=300031` 或「该内容暂时无法查看」。脚本不会自己生成。 |
+| `xsec_source` | 有就留着 | 来源标记（发现页一般是 `pc_feed`）。单独缺了偶尔还能开，复制时不要自己删参数。 |
+
+怎么拿：打开 [小红书发现页](https://www.xiaohongshu.com/explore)，点开笔记或复制卡片链接，把整段地址贴给脚本。分享口令 / `xhslink.com` 可以跟跳转，落到笔记页时仍然需要有效 token。
+
 ## 安装
 
 本 Skill **不是** pip 包。把整个文件夹放到 skills 目录即可。
@@ -110,7 +125,7 @@ pip install youtube-transcript-api yt-dlp faster-whisper openai pydub Pillow
 
 **B站、公开公众号、多数小红书/抖音图文不需要 Cookie。** TikTok 和部分视频下载可能需要。用扩展导出 `cookies.txt` 放到 skill 目录。也认 `www.douyin.com_cookies.txt` 等文件名。
 
-小红书 explore 链接需要**新鲜**的 `xsec_token`（刚从分享或网页复制）。过期令牌常 404 / 300031。
+详见 [小红书链接必须带 `xsec_token`](#小红书链接必须带-xsec_token)。
 
 Windows Chrome 127+ 的 DPAPI 常导致 `--cookies-from-browser` 失败，请手动导出。
 
