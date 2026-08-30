@@ -88,11 +88,16 @@ def _normalize_input_url(raw):
 
 
 def _cacheable(result):
+    """Accept only the current schema. Legacy video_subtitle.py caches lack
+    content_type / cues and must be re-extracted."""
     if not result or result.get("error"):
         return False
-    if result.get("subtitle_text"):
-        return True
-    return result.get("content_type") == "post" and bool(result.get("images"))
+    content_type = result.get("content_type")
+    if content_type == "post":
+        return bool(result.get("images") or result.get("subtitle_text"))
+    if content_type == "video":
+        return bool(result.get("subtitle_text")) and "cues" in result
+    return False
 
 
 def _read_cache(url):
@@ -1437,9 +1442,13 @@ WEIXIN_PAYWALL_MARKERS = (
     "is_pay_subscribe: '1'",
     'is_pay_subscribe: "1"',
 )
-WEIXIN_VERIFY_MARKERS = (
+WEIXIN_VERIFY_IDS = (
     'id="js_verify"',
     'id="verify_code"',
+)
+# Phrase copy can appear in a real article (tutorials about the gate).
+# Only treat these as a gate when #js_content is missing.
+WEIXIN_VERIFY_PHRASES = (
     "此内容需关注",
     "关注后才能阅读",
     "关注后可查看",
@@ -1502,11 +1511,15 @@ def _weixin_blocked_reason(html):
     )
     if WEIXIN_PAYWALL_PHRASE in html and not explicitly_free:
         return WEIXIN_PAYWALL_PHRASE
-    for marker in WEIXIN_VERIFY_MARKERS:
+    for marker in WEIXIN_VERIFY_IDS:
         if marker in html:
             return marker
-    if "js_content" not in html and ("verify" in html.lower() or "captcha" in html.lower()):
-        return "verification page"
+    if "js_content" not in html:
+        for marker in WEIXIN_VERIFY_PHRASES:
+            if marker in html:
+                return marker
+        if "verify" in html.lower() or "captcha" in html.lower():
+            return "verification page"
     return None
 
 
@@ -2300,8 +2313,8 @@ def _make_result(
         "error": error,
         "content_type": content_type,
     }
-    if cues:
-        result["cues"] = cues
+    if content_type == "video":
+        result["cues"] = cues or []
     if content_type == "post":
         result["images"] = images or []
         if images_truncated:
