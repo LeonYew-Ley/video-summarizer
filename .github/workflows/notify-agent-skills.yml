@@ -1,0 +1,21 @@
+name: Notify agent-skills
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch submodule-update
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_SKILLS_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "AGENT_SKILLS_DISPATCH_TOKEN is not set"
+            exit 1
+          fi
+          gh api repos/LeonYew-Ley/agent-skills/dispatches \
+            -f event_type=submodule-update
